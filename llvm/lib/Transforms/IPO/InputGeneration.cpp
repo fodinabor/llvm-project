@@ -1092,7 +1092,7 @@ void InputGenInstrumenter::instrumentFunctionPtrSources(Module &M) {
                    if (VAC.getCtxI()) dbgs() << " and inst " << *VAC.getCtxI();
                    dbgs() << '\n');
 
-        if (isa<Function>(V) || isa<UndefValue>(V) ||
+        if (isa<Function>(V) || isa<UndefValue>(V) || isa<Constant>(V) ||
             isa<ConstantPointerNull>(V) || VMap.lookup(V))
           continue;
 
