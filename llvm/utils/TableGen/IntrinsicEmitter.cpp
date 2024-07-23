@@ -12,6 +12,7 @@
 
 #include "Basic/CodeGenIntrinsics.h"
 #include "Basic/SequenceToOffsetTable.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -28,6 +29,8 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
@@ -62,6 +65,7 @@ public:
   void EmitAttributes(const CodeGenIntrinsicTable &Ints, raw_ostream &OS);
   void EmitIntrinsicToBuiltinMap(const CodeGenIntrinsicTable &Ints,
                                  bool IsClang, raw_ostream &OS);
+  void EmitIntrinsicTypeMap(const CodeGenIntrinsicTable &Ints, raw_ostream &OS);
 };
 } // End anonymous namespace
 
@@ -104,6 +108,9 @@ void IntrinsicEmitter::run(raw_ostream &OS, bool Enums) {
 
     // Emit code to translate MS builtins into LLVM intrinsics.
     EmitIntrinsicToBuiltinMap(Ints, false, OS);
+
+    // Emit code to make the types more easily accessible.
+    EmitIntrinsicTypeMap(Ints, OS);
   }
 }
 
@@ -707,6 +714,110 @@ void IntrinsicEmitter::EmitIntrinsicToBuiltinMap(
   OS << "Intrinsic::not_intrinsic;\n";
   OS << "}\n";
   OS << "#endif\n\n";
+}
+
+void IntrinsicEmitter::EmitIntrinsicTypeMap(const CodeGenIntrinsicTable &Ints,
+                                            raw_ostream &OS) {
+  OS << "#ifdef GET_INTRINSIC_TYPE_MAP\n";
+
+  int Indent = 0;
+  auto IOS = [&Indent, &OS]() -> raw_ostream & {
+    return OS.indent(Indent * 2);
+  };
+
+  auto *RecArgKind = Records.getDef("ArgKind");
+  assert(RecArgKind && "Must have ArgKind Record");
+  SmallDenseMap<int64_t, std::string> ArgKindMap;
+  for (auto &RV : RecArgKind->getValues())
+    ArgKindMap.insert(
+        {cast<IntInit>(RV.getValue())->getValue(), RV.getName().str()});
+
+  for (auto &Int : Ints) {
+    OS << "{\n";
+    Indent++;
+    IOS() << "SmallVector<CallInstInformation> CallIIs;\n";
+
+    SmallDenseMap<unsigned, unsigned> TyMap;
+    SmallDenseMap<unsigned, unsigned> IdxMap;
+
+    int I = 0;
+    auto EmitAnyTypes = [&](Record *Ty) {
+      if (auto *AArgCode = Ty->getValue("ArgCode")) {
+        if (auto *AArgCodeVal = dyn_cast<IntInit>(AArgCode->getValue())) {
+          if (AArgCodeVal->getValue() < 5) {
+            if (auto [V, Inserted] = TyMap.insert({AArgCodeVal->getValue(), I});
+                !Inserted) {
+              IdxMap[I++] = V->second;
+              return;
+            }
+          } else
+            return;
+          IdxMap[I] = I;
+
+          switch (AArgCodeVal->getValue()) {
+          case 0: // Any
+            IOS() << "for (auto Ty" << I++ << " : Types)\n";
+            break;
+          case 1:
+            IOS() << "for (auto Ty" << I++ << " : IntTypes)\n";
+            break;
+          case 2:
+            IOS() << "for (auto Ty" << I++ << " : FloatTypes)\n";
+            break;
+          case 3:
+            IOS() << "for (auto Ty" << I++ << " : {})\n"; // vec unsupported
+            break;
+          case 4:
+            IOS() << "for (auto Ty" << I++ << " : {PtrTy})\n";
+            break;
+          case 7: // already resolved
+            break;
+          }
+          Indent++;
+        }
+      }
+    };
+    for (auto *RTy : Int.IS.RetTys) {
+      if (RTy->isSubClassOf("LLVMAnyType")) {
+        EmitAnyTypes(RTy);
+      } else if (RTy->isSubClassOf("LLVMType")) {
+        IOS() << "auto Ty0 = " << *RTy->getValue("VT")->getValue() << ";\n";
+      }
+    }
+    if (Int.IS.RetTys.empty()) {
+      IOS() << "auto Ty0 = VoidTy;\n";
+      IdxMap.insert({0, 0});
+    }
+
+    for (auto *ATy : Int.IS.ParamTys) {
+      if (ATy->isSubClassOf("LLVMAnyType")) {
+        EmitAnyTypes(ATy);
+      }
+    }
+
+    std::string ArgTyS;
+    {
+      raw_string_ostream SOS{ArgTyS};
+      for (std::size_t I = 0; I < Int.IS.ParamTys.size(); ++I) {
+        if (Int.IS.ParamTys[I]->getValueAsInt("isAny"))
+          SOS << "Ty" << IdxMap[I + 1];
+        else if (Int.IS.ParamTys[I]->isSubClassOf("LLVMType")) {
+          SOS << *Int.IS.ParamTys[I]->getValue("VT")->getValue();
+        }
+        if (I < Int.IS.ParamTys.size() - 1)
+          SOS << ",";
+      }
+    }
+    IOS() << "CallIIs.push_back({\"" << Int.Name << "\", Ty0, {" << ArgTyS
+          << "}});\n";
+    Indent = 1;
+    IOS() << "Intrinsics.insert({Intrinsic::" << Int.EnumName
+          << ", CallIIs});\n";
+    Indent = 0;
+    OS << "}\n";
+  }
+
+  OS << "#endif\n";
 }
 
 static void EmitIntrinsicEnums(RecordKeeper &RK, raw_ostream &OS) {
