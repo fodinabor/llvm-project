@@ -17,7 +17,9 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/ModRef.h"
@@ -31,6 +33,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <string>
@@ -716,23 +719,66 @@ void IntrinsicEmitter::EmitIntrinsicToBuiltinMap(
   OS << "#endif\n\n";
 }
 
-void IntrinsicEmitter::EmitIntrinsicTypeMap(const CodeGenIntrinsicTable &Ints,
-                                            raw_ostream &OS) {
-  OS << "#ifdef GET_INTRINSIC_TYPE_MAP\n";
+static void
+emitIntrinsicTypeMapForTarget(const CodeGenIntrinsicTable &Ints,
+                              raw_ostream &OS,
+                              const CodeGenIntrinsicTable::TargetSet &Set) {
+  OS << "#ifdef GET_INTRINSIC_TYPE_MAP";
+  if (!Set.Name.empty())
+    OS << "_" << StringRef{Set.Name}.upper();
+  OS << "\n";
 
   int Indent = 0;
   auto IOS = [&Indent, &OS]() -> raw_ostream & {
     return OS.indent(Indent * 2);
   };
 
-  auto *RecArgKind = Records.getDef("ArgKind");
-  assert(RecArgKind && "Must have ArgKind Record");
-  SmallDenseMap<int64_t, std::string> ArgKindMap;
-  for (auto &RV : RecArgKind->getValues())
-    ArgKindMap.insert(
-        {cast<IntInit>(RV.getValue())->getValue(), RV.getName().str()});
+  auto CanHandleTypes = [&](const CodeGenIntrinsic &Int) {
+    auto CanHandleType = [&](Record *Ty) {
+      if (!Ty->isValueUnset("ArgCode")) { // AnyType
+        auto AArgCodeVal = Ty->getValueAsInt("ArgCode");
+        if (AArgCodeVal < 5 && // only known any types
+            AArgCodeVal != 3   // no vectors
+        ) {
+          return true;
+        }
+      }
+      if (Ty->isSubClassOf("LLVMType")) {
+        auto *VT = Ty->getRecords().getDef(
+            Ty->getValue("VT")->getValue()->getAsString());
+        if (VT->getValueAsBit("isNormalValueType")) {
+          if (VT->getValueAsBit("isVector") ||
+              VT->getValueAsBit("isScalable") || VT->getValueAsInt("Size") > 64)
+            return false;
+          return StringSwitch<bool>(
+                     Ty->getValue("VT")->getValue()->getAsString())
+              .Case("bf16", false)
+              .Case("funcref", false)
+              .Case("externref", false)
+              .Case("exnref", false)
+              .Case("aarch64svcount", false)
+              .Case("spirvbuiltin", false)
+              .Case("x86mmx", false)
+              .Case("untyped", false)
+              .Case("Glue", false)
+              .Default(true);
+        }
+        if (Ty->isSubClassOf("LLVMQualPointerType"))
+          return true;
+        return false;
+      }
+      return false;
+    };
+    return Int.IS.RetTys.size() == 1 && all_of(Int.IS.RetTys, CanHandleType) &&
+           all_of(Int.IS.ParamTys, CanHandleType);
+  };
 
-  for (auto &Int : Ints) {
+  for (auto It = Ints.begin() + Set.Offset;
+       It != Ints.begin() + Set.Count + Set.Offset; It++) {
+    auto &Int = *It;
+    if (!CanHandleTypes(Int))
+      continue;
+
     OS << "{\n";
     Indent++;
     IOS() << "SmallVector<CallInstInformation> CallIIs;\n";
@@ -756,19 +802,20 @@ void IntrinsicEmitter::EmitIntrinsicTypeMap(const CodeGenIntrinsicTable &Ints,
 
           switch (AArgCodeVal->getValue()) {
           case 0: // Any
-            IOS() << "for (auto Ty" << I++ << " : Types)\n";
+            IOS() << "for (auto Ty" << I++ << " : Types) {\n";
             break;
           case 1:
-            IOS() << "for (auto Ty" << I++ << " : IntTypes)\n";
+            IOS() << "for (auto Ty" << I++ << " : IntTypes) {\n";
             break;
           case 2:
-            IOS() << "for (auto Ty" << I++ << " : FloatTypes)\n";
+            IOS() << "for (auto Ty" << I++ << " : FloatTypes) {\n";
             break;
           case 3:
-            IOS() << "for (auto Ty" << I++ << " : {})\n"; // vec unsupported
+            IOS() << "for (auto Ty" << I++ << " : {}) {\n"; // vec unsupported
             break;
           case 4:
-            IOS() << "for (auto Ty" << I++ << " : {PtrTy})\n";
+            // every pointer is generic atm
+            IOS() << "for (auto Ty" << I++ << " : {PtrTy}) {\n";
             break;
           case 7: // already resolved
             break;
@@ -777,11 +824,26 @@ void IntrinsicEmitter::EmitIntrinsicTypeMap(const CodeGenIntrinsicTable &Ints,
         }
       }
     };
+
+    auto EmitConcreteType = [&](Record *Ty) {
+      if (Ty->isSubClassOf("LLVMQualPointerType")) {
+        // every pointer is generic atm
+        OS << "PtrTy";
+      } else if (Ty->isSubClassOf("LLVMType")) {
+        if (Ty->getValue("VT")->getValue()->getAsString() == "isVoid")
+          OS << "VoidTy";
+        else
+          OS << *Ty->getValue("VT")->getValue();
+      }
+    };
+
     for (auto *RTy : Int.IS.RetTys) {
       if (RTy->isSubClassOf("LLVMAnyType")) {
         EmitAnyTypes(RTy);
       } else if (RTy->isSubClassOf("LLVMType")) {
-        IOS() << "auto Ty0 = " << *RTy->getValue("VT")->getValue() << ";\n";
+        IOS() << "auto Ty0 = ";
+        EmitConcreteType(RTy);
+        OS << ";\n";
       }
     }
     if (Int.IS.RetTys.empty()) {
@@ -795,22 +857,21 @@ void IntrinsicEmitter::EmitIntrinsicTypeMap(const CodeGenIntrinsicTable &Ints,
       }
     }
 
-    std::string ArgTyS;
-    {
-      raw_string_ostream SOS{ArgTyS};
-      for (std::size_t I = 0; I < Int.IS.ParamTys.size(); ++I) {
-        if (Int.IS.ParamTys[I]->getValueAsInt("isAny"))
-          SOS << "Ty" << IdxMap[I + 1];
-        else if (Int.IS.ParamTys[I]->isSubClassOf("LLVMType")) {
-          SOS << *Int.IS.ParamTys[I]->getValue("VT")->getValue();
-        }
-        if (I < Int.IS.ParamTys.size() - 1)
-          SOS << ",";
+    IOS() << "CallIIs.push_back({\"" << Int.Name << "\", Ty0, {";
+    for (std::size_t I = 0; I < Int.IS.ParamTys.size(); ++I) {
+      if (Int.IS.ParamTys[I]->getValueAsInt("isAny"))
+        OS << "Ty" << IdxMap[I + 1];
+      else if (Int.IS.ParamTys[I]->isSubClassOf("LLVMType")) {
+        EmitConcreteType(Int.IS.ParamTys[I]);
       }
+      if (I < Int.IS.ParamTys.size() - 1)
+        OS << ",";
     }
-    IOS() << "CallIIs.push_back({\"" << Int.Name << "\", Ty0, {" << ArgTyS
-          << "}});\n";
-    Indent = 1;
+    OS << "}});\n";
+    while (Indent > 1) {
+      Indent--;
+      IOS() << "}\n";
+    }
     IOS() << "Intrinsics.insert({Intrinsic::" << Int.EnumName
           << ", CallIIs});\n";
     Indent = 0;
@@ -818,6 +879,13 @@ void IntrinsicEmitter::EmitIntrinsicTypeMap(const CodeGenIntrinsicTable &Ints,
   }
 
   OS << "#endif\n";
+}
+
+void IntrinsicEmitter::EmitIntrinsicTypeMap(const CodeGenIntrinsicTable &Ints,
+                                            raw_ostream &OS) {
+  for (const auto &Set : Ints.Targets) {
+    emitIntrinsicTypeMapForTarget(Ints, OS, Set);
+  }
 }
 
 static void EmitIntrinsicEnums(RecordKeeper &RK, raw_ostream &OS) {
