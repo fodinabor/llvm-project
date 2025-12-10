@@ -108,7 +108,7 @@ static const mim::Def *getInnermostElementType(const mim::Def *type) {
 }
 
 ModuleTranslation::ModuleTranslation(Operation *module, mim::Driver &driver,
-                                     std::unique_ptr<mim::World> worldPtr)
+                                     std::unique_ptr<mim::World> &&worldPtr)
     : mlirModule(module), world_(std::move(worldPtr)), driver_(driver),
       typeTranslator(*world_),
       iface(module->getContext()) {
@@ -1104,7 +1104,7 @@ LogicalResult ModuleTranslation::convertIFuncs() {
   //   ifunc->setVisibility(convertVisibilityToMimIR(op.getVisibility_()));
 
   //   ifuncMapping.try_emplace(op, ifunc);
-  // }
+  }
 
   return success();
 }
@@ -1463,8 +1463,8 @@ std::unique_ptr<mim::World> mlir::translateModuleToMimIR(Operation *module,
   //   return nullptr;
   // if (failed(translator.convertGlobalsAndAliases()))
   //   return nullptr;
-  if (failed(translator.convertIFuncs()))
-    return nullptr;
+  // if (failed(translator.convertIFuncs()))
+  //   return nullptr;
   // if (failed(translator.createDependentLibrariesMetadata()))
   //   return nullptr;
 

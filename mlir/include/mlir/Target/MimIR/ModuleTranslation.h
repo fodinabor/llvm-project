@@ -236,7 +236,7 @@ public:
 
 private:
   ModuleTranslation(Operation *module, mim::Driver &driver,
-                    std::unique_ptr<mim::World> worldPtr);
+                    std::unique_ptr<mim::World> &&worldPtr);
   ~ModuleTranslation();
 
   /// Converts individual components.

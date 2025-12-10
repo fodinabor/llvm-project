@@ -6,8 +6,12 @@ set(LLVM_OPTIONAL_SOURCES
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-add_compile_options(-fexceptions -Wno-nullability-extension)
+# add_compile_options(-fexceptions -Wno-nullability-extension)
+add_compile_options(-Wno-nullability-extension)
 
+if(NOT LLVM_ENABLE_EH)
+  message(FATAL_ERROR "MimIR target requires exception handling. Please enable LLVM_ENABLE_EH.")
+endif()
 if(NOT LLVM_ENABLE_RTTI)
   message(FATAL_ERROR "MimIR target requires RTTI. Please enable LLVM_ENABLE_RTTI.")
 endif()
@@ -31,7 +35,6 @@ add_mlir_translation_library(MLIRTargetMimIRExport
   LINK_COMPONENTS
   Analysis
   Core
-  FrontendOpenMP
   TransformUtils
   TargetParser
 
@@ -41,6 +44,8 @@ add_mlir_translation_library(MLIRTargetMimIRExport
   MLIRTransformUtils
   mim::libmim
   )
+
+add_subdirectory(Dialect)
 
 add_mlir_translation_library(MLIRToMimIRTranslationRegistration
   ConvertToMimIR.cpp
@@ -61,13 +66,22 @@ add_mlir_translation_library(MLIRToMimIRTranslationRegistration
   # MLIRVCIXToMimIRTranslation
   # MLIRXeVMToMimIRTranslation
   LINK_LIBS PUBLIC 
+  MLIRBuiltinToMimIRTranslation
   mim::libmim
   )
 
-target_compile_features(MLIRTargetMimIRExport PRIVATE cxx_std_20)
-target_compile_options(MLIRTargetMimIRExport PRIVATE -fexceptions -Wno-nullability-extension)
-target_compile_features(MLIRToMimIRTranslationRegistration PRIVATE cxx_std_20)
-target_compile_options(MLIRToMimIRTranslationRegistration PRIVATE -fexceptions -Wno-nullability-extension)
+target_link_libraries(obj.MLIRTargetMimIRExport PUBLIC
+  mim::libmim
+  )
+
+target_link_libraries(obj.MLIRToMimIRTranslationRegistration PUBLIC
+  mim::libmim
+  )
+
+# target_compile_features(MLIRTargetMimIRExport PRIVATE cxx_std_20)
+# target_compile_options(MLIRTargetMimIRExport PRIVATE -fexceptions -Wno-nullability-extension)
+# target_compile_features(MLIRToMimIRTranslationRegistration PRIVATE cxx_std_20)
+# target_compile_options(MLIRToMimIRTranslationRegistration PRIVATE -fexceptions -Wno-nullability-extension)
 
 # target_link_libraries(obj.MLIRTargetMimIRExport PUBLIC mim::libmim)
 
