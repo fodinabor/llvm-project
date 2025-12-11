@@ -14,6 +14,8 @@
 #ifndef MLIR_TARGET_MIMIR_DIALECT_ALL_H
 #define MLIR_TARGET_MIMIR_DIALECT_ALL_H
 
+#include "mlir/Target/MimIR/Dialect/Arith/ArithToMimIRTranslation.h"
+#include "mlir/Target/MimIR/Dialect/Func/FuncToMimIRTranslation.h"
 #include "mlir/Target/MimIR/Dialect/Builtin/BuiltinToMimIRTranslation.h"
 
 namespace mlir {
@@ -22,15 +24,19 @@ class DialectRegistry;
 /// Registers all dialects that can be translated to MIM IR and the
 /// corresponding translation interfaces.
 static inline void registerAllToMimIRTranslations(DialectRegistry &registry) {
+  registerArithDialectTranslationMimIR(registry);
   registerBuiltinDialectTranslationMimIR(registry);
+  registerFuncDialectTranslationMimIR(registry);
 }
 
 /// Registers all the translations to MIM IR required by GPU passes.
 /// TODO: Remove this function when a safe dialect interface registration
 /// mechanism is implemented, see D157703.
 static inline void
-registerAllGPUToMIMIRTranslations(DialectRegistry &registry) {
+registerAllGPUToMimIRTranslations(DialectRegistry &registry) {
+  registerArithDialectTranslationMimIR(registry);
   registerBuiltinDialectTranslationMimIR(registry);
+  registerFuncDialectTranslationMimIR(registry);
 
 }
 

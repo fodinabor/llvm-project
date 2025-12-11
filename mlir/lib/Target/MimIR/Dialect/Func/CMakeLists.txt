@@ -1,3 +1,3 @@
 target_sources(obj.MLIRTargetMimIRExport PRIVATE
-  BuiltinToMimIRTranslation.cpp
+  FuncToMimIRTranslation.cpp
 )

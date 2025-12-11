@@ -14,23 +14,26 @@
 
 #include "mlir/Target/MimIR/ModuleTranslation.h"
 
-#include "mim/world.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/Attributes.h"
+#include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dialect.h"
 #include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/IR/Location.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Target/MimIR/MimIRTranslationInterface.h"
 #include "mlir/Target/MimIR/TypeToMimIR.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Analysis/TargetFolder.h"
-#include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -40,6 +43,7 @@
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LogicalResult.h"
@@ -47,9 +51,20 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+
+#include <algorithm>
 #include <memory>
 #include <numeric>
 #include <optional>
+
+#include "mim/driver.h"
+#include "mim/world.h"
+#include <mim/ast/ast.h>
+#include <mim/ast/parser.h>
+#include <mim/def.h>
+#include <mim/plugin.h>
+
+#include <string>
 
 #define DEBUG_TYPE "llvm-dialect-to-llvm-ir"
 
@@ -96,6 +111,12 @@ using namespace mlir::MimIR::detail;
 //       llvm::ArrayType::get(elementType, shape.front()), nested);
 // }
 
+Attribute getConstantAttr(Operation *constantOp) {
+  Attribute constant;
+  matchPattern(constantOp, m_Constant(&constant));
+  return constant;
+}
+
 /// Returns the first non-sequential type nested in sequential types.
 static const mim::Def *getInnermostElementType(const mim::Def *type) {
   do {
@@ -110,12 +131,9 @@ static const mim::Def *getInnermostElementType(const mim::Def *type) {
 ModuleTranslation::ModuleTranslation(Operation *module, mim::Driver &driver,
                                      std::unique_ptr<mim::World> &&worldPtr)
     : mlirModule(module), world_(std::move(worldPtr)), driver_(driver),
-      typeTranslator(*world_),
-      iface(module->getContext()) {
-}
+      typeTranslator(*world_), iface(module->getContext()) {}
 
-ModuleTranslation::~ModuleTranslation() {
-}
+ModuleTranslation::~ModuleTranslation() {}
 
 void ModuleTranslation::forgetMapping(Region &region) {
   SmallVector<Region *> toProcess;
@@ -178,7 +196,7 @@ LogicalResult ModuleTranslation::convertBlockImpl(Block &bb,
                                                   bool recordInsertions) {
   // builder.SetInsertPoint(lookupBlock(&bb));
   // auto *subprogram = builder.GetInsertBlock()->getParent()->getSubprogram();
-  const mim::Lam *l = lookupBlock(&bb);
+  mim::Lam *l = lookupBlock(&bb);
 
   // Before traversing operations, make block arguments available through
   // value remapping and PHI nodes, but do not add incoming edges for the PHI
@@ -187,24 +205,13 @@ LogicalResult ModuleTranslation::convertBlockImpl(Block &bb,
   // first block have been already made available through the remapping of
   // MimIR function arguments.
   if (!ignoreArguments) {
-    auto predecessors = bb.getPredecessors();
-    unsigned numPredecessors =
-        std::distance(predecessors.begin(), predecessors.end());
-    for (auto arg : bb.getArguments()) {
-      auto wrappedType = arg.getType();
-      // if (!isCompatibleType(wrappedType))
-      //   return emitError(bb.front().getLoc(),
-      //                    "block argument does not have an MimIR type");
-      const mim::Def *type = convertType(wrappedType);
-      // llvm::PHINode *phi = builder.CreatePHI(type, numPredecessors);
-      // mapValue(arg, phi);
+    for (auto [arg, var] : llvm::zip(bb.getArguments(), l->vars())) {
+      mapValue(arg, var);
     }
   }
 
   // Traverse operations.
   for (auto &op : bb) {
-    // Set the current debug location within the builder.
-
     if (failed(convertOperation(op, recordInsertions)))
       return failure();
   }
@@ -223,19 +230,20 @@ static Block &getModuleBody(Operation *module) {
 /// initializer is considered externally visible and defined in this module, the
 /// variable without an initializer is externally available and is defined
 /// elsewhere.
-static bool shouldDropGlobalInitializer(llvm::GlobalValue::LinkageTypes linkage,
-                                        llvm::Constant *cst) {
-  return (linkage == llvm::GlobalVariable::ExternalLinkage && !cst) ||
-         linkage == llvm::GlobalVariable::ExternalWeakLinkage;
-}
+// static bool shouldDropGlobalInitializer(llvm::GlobalValue::LinkageTypes
+// linkage,
+//                                         llvm::Constant *cst) {
+//   return (linkage == llvm::GlobalVariable::ExternalLinkage && !cst) ||
+//          linkage == llvm::GlobalVariable::ExternalWeakLinkage;
+// }
 
 /// Sets the runtime preemption specifier of `gv` to dso_local if
 /// `dsoLocalRequested` is true, otherwise it is left unchanged.
-static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
-                                          llvm::GlobalValue *gv) {
-  if (dsoLocalRequested)
-    gv->setDSOLocal(true);
-}
+// static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
+//                                           llvm::GlobalValue *gv) {
+//   if (dsoLocalRequested)
+//     gv->setDSOLocal(true);
+// }
 
 /// Attempts to translate an MLIR attribute identified by `key`, optionally with
 /// the given `value`, into an MimIR IR attribute. Reports errors at `loc` if
@@ -319,7 +327,8 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 //   // Mapping from compile unit to its respective set of global variables.
 //   DenseMap<llvm::DICompileUnit *, SmallVector<llvm::Metadata *>> allGVars;
 
-//   // First, create all global variables and global aliases in MimIR IR. A global
+//   // First, create all global variables and global aliases in MimIR IR. A
+//   global
 //   // or alias body may refer to another global/alias or itself, so all the
 //   // mapping needs to happen prior to body conversion.
 
@@ -328,9 +337,11 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 //     llvm::Type *type = convertType(op.getType());
 //     llvm::Constant *cst = nullptr;
 //     if (op.getValueOrNull()) {
-//       // String attributes are treated separately because they cannot appear as
-//       // in-function constants and are thus not supported by getMimIRConstant.
-//       if (auto strAttr = dyn_cast_or_null<StringAttr>(op.getValueOrNull())) {
+//       // String attributes are treated separately because they cannot appear
+//       as
+//       // in-function constants and are thus not supported by
+//       getMimIRConstant. if (auto strAttr =
+//       dyn_cast_or_null<StringAttr>(op.getValueOrNull())) {
 //         cst = llvm::ConstantDataArray::getString(
 //             llvmModule->getContext(), strAttr.getValue(), /*AddNull=*/false);
 //         type = cst->getType();
@@ -343,7 +354,8 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 //     auto linkage = convertLinkageToMimIR(op.getLinkage());
 
 //     // MimIR IR requires constant with linkage other than external or weak
-//     // external to have initializers. If MLIR does not provide an initializer,
+//     // external to have initializers. If MLIR does not provide an
+//     initializer,
 //     // default to undef.
 //     bool dropInitializer = shouldDropGlobalInitializer(linkage, cst);
 //     if (!dropInitializer && !cst)
@@ -393,7 +405,8 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 //         // directly assigned to DICompileUnit. We have to build the list by
 //         // looking at the dbgExpr of all the GlobalOps. The scope of the
 //         // variable is used to get the DICompileUnit in which to add it. But
-//         // there are cases where the scope of a global does not directly point
+//         // there are cases where the scope of a global does not directly
+//         point
 //         // to the DICompileUnit and we have to do a bit more work to get to
 //         // it. Some of those cases are:
 //         //
@@ -409,7 +422,8 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 //         llvm::DIScope *scope = diGlobalVar->getScope();
 //         if (auto *mod = dyn_cast_if_present<llvm::DIModule>(scope))
 //           scope = mod->getScope();
-//         else if (auto *cb = dyn_cast_if_present<llvm::DICommonBlock>(scope)) {
+//         else if (auto *cb = dyn_cast_if_present<llvm::DICommonBlock>(scope))
+//         {
 //           if (auto *sp =
 //                   dyn_cast_if_present<llvm::DISubprogram>(cb->getScope()))
 //             scope = sp->getUnit();
@@ -446,14 +460,15 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 
 //     // Note address space and aliasee info isn't set just yet.
 //     llvm::GlobalAlias *var = llvm::GlobalAlias::create(
-//         type, op.getAddrSpace(), linkage, op.getSymName(), /*placeholder*/ cst,
-//         &llvmMod);
+//         type, op.getAddrSpace(), linkage, op.getSymName(), /*placeholder*/
+//         cst, &llvmMod);
 
 //     var->setThreadLocalMode(op.getThreadLocal_()
 //                                 ? llvm::GlobalAlias::GeneralDynamicTLSModel
 //                                 : llvm::GlobalAlias::NotThreadLocal);
 
-//     // Note there is no need to setup the comdat because GlobalAlias calls into
+//     // Note there is no need to setup the comdat because GlobalAlias calls
+//     into
 //     // the aliasee comdat information automatically.
 
 //     if (op.getUnnamedAddr().has_value())
@@ -477,17 +492,22 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 
 //       for (auto &op : initializer->without_terminator()) {
 //         if (failed(convertOperation(op, builder)))
-//           return emitError(op.getLoc(), "fail to convert global initializer");
+//           return emitError(op.getLoc(), "fail to convert global
+//           initializer");
 //         auto *cst = dyn_cast<llvm::Constant>(lookupValue(op.getResult(0)));
 //         if (!cst)
 //           return emitError(op.getLoc(), "unemittable constant value");
 
 //         // When emitting an MimIR constant, a new constant is created and the
-//         // old constant may become dangling and take space. We should remove the
-//         // dangling constants to avoid memory explosion especially for constant
+//         // old constant may become dangling and take space. We should remove
+//         the
+//         // dangling constants to avoid memory explosion especially for
+//         constant
 //         // arrays whose number of elements is large.
-//         // Because multiple operations may refer to the same constant, we need
-//         // to count the number of uses of each constant array and remove it only
+//         // Because multiple operations may refer to the same constant, we
+//         need
+//         // to count the number of uses of each constant array and remove it
+//         only
 //         // when the count becomes zero.
 //         if (auto *agg = dyn_cast<llvm::ConstantAggregate>(cst)) {
 //           numConstantsHit++;
@@ -507,9 +527,8 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 //           if (!cst)
 //             continue;
 //           auto iter = constantAggregateUseMap.find(cst);
-//           assert(iter != constantAggregateUseMap.end() && "constant not found");
-//           iter->second--;
-//           if (iter->second == 0) {
+//           assert(iter != constantAggregateUseMap.end() && "constant not
+//           found"); iter->second--; if (iter->second == 0) {
 //             // NOTE: cannot call removeDeadConstantUsers() here because it
 //             // may remove the constant which has uses not be converted yet.
 //             if (cst->user_empty()) {
@@ -554,8 +573,10 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 //     if (!ctorOp && !dtorOp)
 //       continue;
 
-//     // The empty / zero initialized version of llvm.global_(c|d)tors cannot be
-//     // handled by appendGlobalFn logic below, which just ignores empty (c|d)tor
+//     // The empty / zero initialized version of llvm.global_(c|d)tors cannot
+//     be
+//     // handled by appendGlobalFn logic below, which just ignores empty
+//     (c|d)tor
 //     // lists. Make sure it gets emitted.
 //     if ((ctorOp && ctorOp.getCtors().empty()) ||
 //         (dtorOp && dtorOp.getDtors().empty())) {
@@ -573,7 +594,8 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 //     } else {
 //       auto range = ctorOp
 //                        ? llvm::zip(ctorOp.getCtors(), ctorOp.getPriorities())
-//                        : llvm::zip(dtorOp.getDtors(), dtorOp.getPriorities());
+//                        : llvm::zip(dtorOp.getDtors(),
+//                        dtorOp.getPriorities());
 //       auto appendGlobalFn =
 //           ctorOp ? llvm::appendToGlobalCtors : llvm::appendToGlobalDtors;
 //       for (const auto &[sym, prio] : range) {
@@ -589,7 +611,8 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 //     if (failed(convertDialectAttributes(op, {})))
 //       return failure();
 
-//   // Finally, update the compile units their respective sets of global variables
+//   // Finally, update the compile units their respective sets of global
+//   variables
 //   // created earlier.
 //   for (const auto &[compileUnit, globals] : allGVars) {
 //     compileUnit->replaceGlobalVariables(
@@ -634,7 +657,8 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 // /// Return a representation of `value` as an MDNode.
 // static llvm::MDNode *convertIntegerToMDNode(llvm::MimIRContext &context,
 //                                             const llvm::APInt &value) {
-//   return llvm::MDNode::get(context, convertIntegerToMetadata(context, value));
+//   return llvm::MDNode::get(context, convertIntegerToMetadata(context,
+//   value));
 // }
 
 /// Return an MDNode encoding `vec_type_hint` metadata.
@@ -659,126 +683,51 @@ static void addRuntimePreemptionSpecifier(bool dsoLocalRequested,
 //   return llvm::MDNode::get(context, mdValues);
 // }
 
-/*
-LogicalResult ModuleTranslation::convertOneFunction(MimIRFuncOp func) {
+LogicalResult ModuleTranslation::convertOneFunction(func::FuncOp &func) {
   // Clear the block, branch value mappings, they are only relevant within one
   // function.
   blockMapping.clear();
   valueMapping.clear();
   branchMapping.clear();
-  llvm::Function *llvmFunc = lookupFunction(func.getName());
+  mim::Lam *lam = lookupFunction(func.getName());
 
   // Add function arguments to the value remapping table.
-  for (auto [mlirArg, llvmArg] :
-       llvm::zip(func.getArguments(), llvmFunc->args()))
-    mapValue(mlirArg, &llvmArg);
-
-  // Check the personality and set it.
-  if (func.getPersonality()) {
-    llvm::Type *ty = llvm::PointerType::getUnqual(llvmFunc->getContext());
-    if (llvm::Constant *pfunc = getMimIRConstant(ty, func.getPersonalityAttr(),
-                                                func.getLoc(), *this))
-      llvmFunc->setPersonalityFn(pfunc);
-  }
-
-  if (std::optional<StringRef> section = func.getSection())
-    llvmFunc->setSection(*section);
-
-  if (func.getArmStreaming())
-    llvmFunc->addFnAttr("aarch64_pstate_sm_enabled");
-  else if (func.getArmLocallyStreaming())
-    llvmFunc->addFnAttr("aarch64_pstate_sm_body");
-  else if (func.getArmStreamingCompatible())
-    llvmFunc->addFnAttr("aarch64_pstate_sm_compatible");
-
-  if (func.getArmNewZa())
-    llvmFunc->addFnAttr("aarch64_new_za");
-  else if (func.getArmInZa())
-    llvmFunc->addFnAttr("aarch64_in_za");
-  else if (func.getArmOutZa())
-    llvmFunc->addFnAttr("aarch64_out_za");
-  else if (func.getArmInoutZa())
-    llvmFunc->addFnAttr("aarch64_inout_za");
-  else if (func.getArmPreservesZa())
-    llvmFunc->addFnAttr("aarch64_preserves_za");
-
-  if (auto targetCpu = func.getTargetCpu())
-    llvmFunc->addFnAttr("target-cpu", *targetCpu);
-
-  if (auto tuneCpu = func.getTuneCpu())
-    llvmFunc->addFnAttr("tune-cpu", *tuneCpu);
-
-  if (auto reciprocalEstimates = func.getReciprocalEstimates())
-    llvmFunc->addFnAttr("reciprocal-estimates", *reciprocalEstimates);
-
-  if (auto preferVectorWidth = func.getPreferVectorWidth())
-    llvmFunc->addFnAttr("prefer-vector-width", *preferVectorWidth);
-
-  if (auto attr = func.getVscaleRange())
-    llvmFunc->addFnAttr(llvm::Attribute::getWithVScaleRangeArgs(
-        getMimIRContext(), attr->getMinRange().getInt(),
-        attr->getMaxRange().getInt()));
-
-  if (auto noInfsFpMath = func.getNoInfsFpMath())
-    llvmFunc->addFnAttr("no-infs-fp-math", llvm::toStringRef(*noInfsFpMath));
-
-  if (auto noNansFpMath = func.getNoNansFpMath())
-    llvmFunc->addFnAttr("no-nans-fp-math", llvm::toStringRef(*noNansFpMath));
-
-  if (auto noSignedZerosFpMath = func.getNoSignedZerosFpMath())
-    llvmFunc->addFnAttr("no-signed-zeros-fp-math",
-                        llvm::toStringRef(*noSignedZerosFpMath));
-
-  if (auto denormalFpMath = func.getDenormalFpMath())
-    llvmFunc->addFnAttr("denormal-fp-math", *denormalFpMath);
-
-  if (auto denormalFpMathF32 = func.getDenormalFpMathF32())
-    llvmFunc->addFnAttr("denormal-fp-math-f32", *denormalFpMathF32);
-
-  if (auto fpContract = func.getFpContract())
-    llvmFunc->addFnAttr("fp-contract", *fpContract);
-
-  if (auto instrumentFunctionEntry = func.getInstrumentFunctionEntry())
-    llvmFunc->addFnAttr("instrument-function-entry", *instrumentFunctionEntry);
-
-  if (auto instrumentFunctionExit = func.getInstrumentFunctionExit())
-    llvmFunc->addFnAttr("instrument-function-exit", *instrumentFunctionExit);
+  for (auto [mlirArg, mimVar] : llvm::zip(func.getArguments(), lam->vars()))
+    mapValue(mlirArg, mimVar);
 
   // First, create all blocks so we can jump to them.
-  llvm::MimIRContext &llvmContext = llvmFunc->getContext();
   for (auto &bb : func) {
-    auto *llvmBB = llvm::BasicBlock::Create(llvmContext);
-    llvmBB->insertInto(llvmFunc);
-    mapBlock(&bb, llvmBB);
+    mim::DefVec blockArgTypes{bb.getArguments(), [this](Value v) {
+                                return convertType(v.getType());
+                              }};
+    // todo: do we need a cn for the successors?
+    auto *newBlock = world_->mut_con(blockArgTypes);
+    mapBlock(&bb, newBlock);
   }
 
   // Then, convert blocks one by one in topological order to ensure defs are
   // converted before uses.
   auto blocks = getBlocksSortedByDominance(func.getBody());
   for (Block *bb : blocks) {
-    CapturingIRBuilder builder(llvmContext,
-                               llvm::TargetFolder(llvmModule->getDataLayout()));
-    if (failed(convertBlockImpl(*bb, bb->isEntryBlock(), builder,
-                                /*recordInsertions=* /true)))
+    if (failed(convertBlockImpl(*bb, bb->isEntryBlock(),
+                                /*recordInsertions=*/true)))
       return failure();
   }
-
-  // After all blocks have been traversed and values mapped, connect the PHI
-  // nodes to the results of preceding blocks.
-  detail::connectPHINodes(func.getBody(), *this);
 
   // Finally, convert dialect attributes attached to the function.
   return convertDialectAttributes(func, {});
 }
-*/
 
-// LogicalResult ModuleTranslation::convertDialectAttributes(
-//     Operation *op, ArrayRef<llvm::Instruction *> instructions) {
-//   for (NamedAttribute attribute : op->getDialectAttrs())
-//     if (failed(iface.amendOperation(op, instructions, attribute, *this)))
-//       return failure();
-//   return success();
-// }
+LogicalResult
+ModuleTranslation::convertDialectAttributes(Operation *op,
+                                            ArrayRef<const mim::Def *> nodes) {
+  for (NamedAttribute attribute : op->getDialectAttrs())
+    llvm::outs() << "Warning: skipping dialect attribute '"
+                 << attribute.getName() << "=" << attribute.getValue() << "'\n";
+  //   if (failed(iface.amendOperation(op, instructions, attribute, *this)))
+  //     return failure();
+  return success();
+}
 
 /*
 /// Converts memory effect attributes from `func` and attaches them to
@@ -872,8 +821,8 @@ static void convertFunctionKernelAttributes(MimIRFuncOp func,
 // static LogicalResult convertParameterAttr(llvm::AttrBuilder &attrBuilder,
 //                                           llvm::Attribute::AttrKind llvmKind,
 //                                           NamedAttribute namedAttr,
-//                                           ModuleTranslation &moduleTranslation,
-//                                           Location loc) {
+//                                           ModuleTranslation
+//                                           &moduleTranslation, Location loc) {
 //   return llvm::TypeSwitch<Attribute, LogicalResult>(namedAttr.getValue())
 //       .Case<TypeAttr>([&](auto typeAttr) {
 //         attrBuilder.addTypeAttr(
@@ -976,7 +925,8 @@ ModuleTranslation::convertParameterAttrs(MimIRFuncOp func, int argIdx,
 //     auto it = attrNameToKindMapping.find(namedAttr.getName());
 //     if (it != attrNameToKindMapping.end()) {
 //       llvm::Attribute::AttrKind llvmKind = it->second;
-//       if (failed(convertParameterAttr(attrBuilder, llvmKind, namedAttr, *this,
+//       if (failed(convertParameterAttr(attrBuilder, llvmKind, namedAttr,
+//       *this,
 //                                       loc)))
 //         return failure();
 //     }
@@ -984,81 +934,90 @@ ModuleTranslation::convertParameterAttrs(MimIRFuncOp func, int argIdx,
 
 //   return attrBuilder;
 // }
-/*
+
 LogicalResult ModuleTranslation::convertFunctionSignatures() {
   // Declare all functions first because there may be function calls that form a
   // call graph with cycles, or global initializers that reference functions.
-  for (auto function : getModuleBody(mlirModule).getOps<MimIRFuncOp>()) {
-    llvm::FunctionCallee llvmFuncCst = llvmModule->getOrInsertFunction(
-        function.getName(),
-        cast<llvm::FunctionType>(convertType(function.getFunctionType())));
-    llvm::Function *llvmFunc = cast<llvm::Function>(llvmFuncCst.getCallee());
-    llvmFunc->setLinkage(convertLinkageToMimIR(function.getLinkage()));
-    llvmFunc->setCallingConv(convertCConvToMimIR(function.getCConv()));
-    mapFunction(function.getName(), llvmFunc);
-    addRuntimePreemptionSpecifier(function.getDsoLocal(), llvmFunc);
+  for (auto function : getModuleBody(mlirModule).getOps<func::FuncOp>()) {
+    mim::DefVec lamArgTypes{function.getArgumentTypes(),
+                            [this](Type t) { return convertType(t); }};
+    mim::DefVec conArgTypes{function.getFunctionType().getResults(),
+                            [this](Type t) { return convertType(t); }};
+    const auto *retCn = world_->cn(conArgTypes);
+    lamArgTypes.push_back(retCn);
+    auto *lam =
+        world_->mut_con(lamArgTypes)->set(std::string(function.getName()));
+
+    mapFunction(function.getName(), lam);
 
     // Convert function attributes.
-    convertFunctionAttributes(function, llvmFunc);
+    // convertFunctionAttributes(function, lam);
 
     // Convert function kernel attributes to metadata.
-    convertFunctionKernelAttributes(function, llvmFunc, *this);
+    // convertFunctionKernelAttributes(function, lam, *this);
 
     // Convert function_entry_count attribute to metadata.
-    if (std::optional<uint64_t> entryCount = function.getFunctionEntryCount())
-      llvmFunc->setEntryCount(entryCount.value());
+    // if (std::optional<uint64_t> entryCount =
+    // function.getFunctionEntryCount())
+    //   llvmFunc->setEntryCount(entryCount.value());
 
-    // Convert result attributes.
-    if (ArrayAttr allResultAttrs = function.getAllResultAttrs()) {
-      DictionaryAttr resultAttrs = cast<DictionaryAttr>(allResultAttrs[0]);
-      FailureOr<llvm::AttrBuilder> attrBuilder =
-          convertParameterAttrs(function, -1, resultAttrs);
-      if (failed(attrBuilder))
-        return failure();
-      llvmFunc->addRetAttrs(*attrBuilder);
-    }
+    // // Convert result attributes.
+    // if (ArrayAttr allResultAttrs = function.getAllResultAttrs()) {
+    //   DictionaryAttr resultAttrs = cast<DictionaryAttr>(allResultAttrs[0]);
+    //   FailureOr<llvm::AttrBuilder> attrBuilder =
+    //       convertParameterAttrs(function, -1, resultAttrs);
+    //   if (failed(attrBuilder))
+    //     return failure();
+    //   llvmFunc->addRetAttrs(*attrBuilder);
+    // }
 
     // Convert argument attributes.
-    for (auto [argIdx, llvmArg] : llvm::enumerate(llvmFunc->args())) {
-      if (DictionaryAttr argAttrs = function.getArgAttrDict(argIdx)) {
-        FailureOr<llvm::AttrBuilder> attrBuilder =
-            convertParameterAttrs(function, argIdx, argAttrs);
-        if (failed(attrBuilder))
-          return failure();
-        llvmArg.addAttrs(*attrBuilder);
-      }
-    }
+    // for (auto [argIdx, llvmArg] : llvm::enumerate(llvmFunc->args())) {
+    //   if (DictionaryAttr argAttrs = function.getArgAttrDict(argIdx)) {
+    //     FailureOr<llvm::AttrBuilder> attrBuilder =
+    //         convertParameterAttrs(function, argIdx, argAttrs);
+    //     if (failed(attrBuilder))
+    //       return failure();
+    //     llvmArg.addAttrs(*attrBuilder);
+    //   }
+    // }
 
     // Forward the pass-through attributes to MimIR.
-    FailureOr<llvm::AttrBuilder> convertedPassthroughAttrs =
-        convertMLIRAttributesToMimIR(function.getLoc(), llvmFunc->getContext(),
-                                    function.getPassthroughAttr(),
-                                    function.getPassthroughAttrName());
-    if (failed(convertedPassthroughAttrs))
-      return failure();
-    llvmFunc->addFnAttrs(*convertedPassthroughAttrs);
+    // FailureOr<llvm::AttrBuilder> convertedPassthroughAttrs =
+    //     convertMLIRAttributesToMimIR(function.getLoc(),
+    //     llvmFunc->getContext(),
+    //                                  function.getPassthroughAttr(),
+    //                                  function.getPassthroughAttrName());
+    // if (failed(convertedPassthroughAttrs))
+    //   return failure();
+    // llvmFunc->addFnAttrs(*convertedPassthroughAttrs);
 
     // Convert visibility attribute.
-    llvmFunc->setVisibility(convertVisibilityToMimIR(function.getVisibility_()));
+    // llvmFunc->setVisibility(
+    //     convertVisibilityToMimIR(function.getVisibility()));
+    if (function.getVisibility() == SymbolTable::Visibility::Public)
+      lam->externalize();
+    else if (function.isExternal())
+      lam->externalize();
 
-    // Convert the comdat attribute.
-    if (std::optional<mlir::SymbolRefAttr> comdat = function.getComdat()) {
-      auto selectorOp = cast<ComdatSelectorOp>(
-          SymbolTable::lookupNearestSymbolFrom(function, *comdat));
-      llvmFunc->setComdat(comdatMapping.lookup(selectorOp));
-    }
+    // // Convert the comdat attribute.
+    // if (std::optional<mlir::SymbolRefAttr> comdat = function.getComdat()) {
+    //   auto selectorOp = cast<ComdatSelectorOp>(
+    //       SymbolTable::lookupNearestSymbolFrom(function, *comdat));
+    //   llvmFunc->setComdat(comdatMapping.lookup(selectorOp));
+    // }
 
-    if (auto gc = function.getGarbageCollector())
-      llvmFunc->setGC(gc->str());
+    // if (auto gc = function.getGarbageCollector())
+    //   llvmFunc->setGC(gc->str());
 
-    if (auto unnamedAddr = function.getUnnamedAddr())
-      llvmFunc->setUnnamedAddr(convertUnnamedAddrToMimIR(*unnamedAddr));
+    // if (auto unnamedAddr = function.getUnnamedAddr())
+    //   llvmFunc->setUnnamedAddr(convertUnnamedAddrToMimIR(*unnamedAddr));
 
-    if (auto alignment = function.getAlignment())
-      llvmFunc->setAlignment(llvm::MaybeAlign(*alignment));
+    // if (auto alignment = function.getAlignment())
+    //   llvmFunc->setAlignment(llvm::MaybeAlign(*alignment));
 
     // Translate the debug information for this function.
-    debugTranslation->translate(function, *llvmFunc);
+    // debugTranslation->translate(function, *llvmFunc);
   }
 
   return success();
@@ -1066,7 +1025,7 @@ LogicalResult ModuleTranslation::convertFunctionSignatures() {
 
 LogicalResult ModuleTranslation::convertFunctions() {
   // Convert functions.
-  for (auto function : getModuleBody(mlirModule).getOps<MimIRFuncOp>()) {
+  for (auto function : getModuleBody(mlirModule).getOps<func::FuncOp>()) {
     // Do not convert external functions, but do process dialect attributes
     // attached to them.
     if (function.isExternal()) {
@@ -1081,7 +1040,6 @@ LogicalResult ModuleTranslation::convertFunctions() {
 
   return success();
 }
-*/
 LogicalResult ModuleTranslation::convertIFuncs() {
   // for (auto op : getModuleBody(mlirModule).getOps<IFuncOp>()) {
   //   llvm::Type *type = convertType(op.getIFuncType());
@@ -1091,20 +1049,22 @@ LogicalResult ModuleTranslation::convertIFuncs() {
   //   if (auto *resolverFn = lookupFunction(op.getResolver())) {
   //     resolver = cast<llvm::Constant>(resolverFn);
   //   } else {
-  //     Operation *aliasOp = symbolTable().lookupSymbolIn(parentMimIRModule(op),
+  //     Operation *aliasOp =
+  //     symbolTable().lookupSymbolIn(parentMimIRModule(op),
   //                                                       op.getResolverAttr());
   //     resolver = cast<llvm::Constant>(lookupAlias(aliasOp));
   //   }
 
   //   auto *ifunc =
   //       llvm::GlobalIFunc::create(type, op.getAddressSpace(), linkage,
-  //                                 op.getSymName(), resolver, llvmModule.get());
+  //                                 op.getSymName(), resolver,
+  //                                 llvmModule.get());
   //   addRuntimePreemptionSpecifier(op.getDsoLocal(), ifunc);
   //   ifunc->setUnnamedAddr(convertUnnamedAddrToMimIR(op.getUnnamedAddr()));
   //   ifunc->setVisibility(convertVisibilityToMimIR(op.getVisibility_()));
 
   //   ifuncMapping.try_emplace(op, ifunc);
-  }
+  // }
 
   return success();
 }
@@ -1113,11 +1073,14 @@ LogicalResult ModuleTranslation::convertComdats() {
   // for (auto comdatOp : getModuleBody(mlirModule).getOps<ComdatOp>()) {
   //   for (auto selectorOp : comdatOp.getOps<ComdatSelectorOp>()) {
   //     llvm::Module *module = getMimIRModule();
-  //     if (module->getComdatSymbolTable().contains(selectorOp.getSymName()))
+  //     if
+  //     (module->getComdatSymbolTable().contains(selectorOp.getSymName()))
   //       return emitError(selectorOp.getLoc())
-  //              << "comdat selection symbols must be unique even in different "
+  //              << "comdat selection symbols must be unique even in
+  //              different "
   //                 "comdat regions";
-  //     llvm::Comdat *comdat = module->getOrInsertComdat(selectorOp.getSymName());
+  //     llvm::Comdat *comdat =
+  //     module->getOrInsertComdat(selectorOp.getSymName());
   //     comdat->setSelectionKind(convertComdatToMimIR(selectorOp.getComdat()));
   //     comdatMapping.try_emplace(selectorOp, comdat);
   //   }
@@ -1129,11 +1092,13 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
   // for (auto &[blockAddressOp, llvmCst] : unresolvedBlockAddressMapping) {
   //   BlockAddressAttr blockAddressAttr = blockAddressOp.getBlockAddr();
   //   llvm::BasicBlock *llvmBlock = lookupBlockAddress(blockAddressAttr);
-  //   assert(llvmBlock && "expected MimIR blocks to be already translated");
+  //   assert(llvmBlock && "expected MimIR blocks to be already
+  //   translated");
 
   //   // Update mapping with new block address constant.
   //   auto *llvmBlockAddr = llvm::BlockAddress::get(
-  //       lookupFunction(blockAddressAttr.getFunction().getValue()), llvmBlock);
+  //       lookupFunction(blockAddressAttr.getFunction().getValue()),
+  //       llvmBlock);
   //   llvmCst->replaceAllUsesWith(llvmBlockAddr);
   //   assert(llvmCst->use_empty() && "expected all uses to be replaced");
   //   cast<llvm::GlobalVariable>(llvmCst)->eraseFromParent();
@@ -1205,7 +1170,8 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 
 // void ModuleTranslation::setAliasScopeMetadata(AliasAnalysisOpInterface op,
 //                                               llvm::Instruction *inst) {
-//   auto populateScopeMetadata = [&](ArrayAttr aliasScopeAttrs, unsigned kind) {
+//   auto populateScopeMetadata = [&](ArrayAttr aliasScopeAttrs, unsigned kind)
+//   {
 //     if (!aliasScopeAttrs || aliasScopeAttrs.empty())
 //       return;
 //     llvm::MDNode *node = getOrCreateAliasScopes(
@@ -1229,12 +1195,15 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 //   if (!tagRefs || tagRefs.empty())
 //     return;
 
-//   // MimIR IR currently does not support attaching more than one TBAA access tag
+//   // MimIR IR currently does not support attaching more than one TBAA access
+//   tag
 //   // to a memory accessing instruction. It may be useful to support this in
-//   // future, but for the time being just ignore the metadata if MLIR operation
+//   // future, but for the time being just ignore the metadata if MLIR
+//   operation
 //   // has multiple access tags.
 //   if (tagRefs.size() > 1) {
-//     op.emitWarning() << "TBAA access tags were not translated, because MimIR "
+//     op.emitWarning() << "TBAA access tags were not translated, because MimIR
+//     "
 //                         "IR only supports a single tag per instruction";
 //     return;
 //   }
@@ -1250,7 +1219,8 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 //     return;
 
 //   llvm::MDNode *derefSizeNode = llvm::MDNode::get(
-//       getMimIRContext(), llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+//       getMimIRContext(),
+//       llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
 //                              llvm::IntegerType::get(getMimIRContext(), 64),
 //                              derefAttr.getBytes())));
 //   unsigned kindId = derefAttr.getMayBeNull()
@@ -1259,16 +1229,18 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 //   inst->setMetadata(kindId, derefSizeNode);
 // }
 
-// void ModuleTranslation::setBranchWeightsMetadata(WeightedBranchOpInterface op) {
+// void ModuleTranslation::setBranchWeightsMetadata(WeightedBranchOpInterface
+// op) {
 //   SmallVector<uint32_t> weights;
 //   llvm::transform(op.getWeights(), std::back_inserter(weights),
-//                   [](int32_t value) { return static_cast<uint32_t>(value); });
+//                   [](int32_t value) { return static_cast<uint32_t>(value);
+//                   });
 //   if (weights.empty())
 //     return;
 
-//   llvm::Instruction *inst = isa<CallOp>(op) ? lookupCall(op) : lookupBranch(op);
-//   assert(inst && "expected the operation to have a mapping to an instruction");
-//   inst->setMetadata(
+//   llvm::Instruction *inst = isa<CallOp>(op) ? lookupCall(op) :
+//   lookupBranch(op); assert(inst && "expected the operation to have a mapping
+//   to an instruction"); inst->setMetadata(
 //       llvm::MimIRContext::MD_prof,
 //       llvm::MDBuilder(getMimIRContext()).createBranchWeights(weights));
 // }
@@ -1280,7 +1252,8 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 //   // Walk the entire module and create all metadata nodes for the TBAA
 //   // attributes. The code below relies on two invariants of the
 //   // `AttrTypeWalker`:
-//   // 1. Attributes are visited in post-order: Since the attributes create a DAG,
+//   // 1. Attributes are visited in post-order: Since the attributes create a
+//   DAG,
 //   //    this ensures that any lookups into `tbaaMetadataMapping` for child
 //   //    attributes succeed.
 //   // 2. Attributes are only ever visited once: This way we don't leak any
@@ -1288,7 +1261,8 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 //   AttrTypeWalker walker;
 //   walker.addWalk([&](TBAARootAttr root) {
 //     tbaaMetadataMapping.insert(
-//         {root, llvm::MDNode::get(ctx, llvm::MDString::get(ctx, root.getId()))});
+//         {root, llvm::MDNode::get(ctx, llvm::MDString::get(ctx,
+//         root.getId()))});
 //   });
 
 //   walker.addWalk([&](TBAATypeDescriptorAttr descriptor) {
@@ -1300,7 +1274,8 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 //           llvm::ConstantInt::get(offsetTy, member.getOffset())));
 //     }
 
-//     tbaaMetadataMapping.insert({descriptor, llvm::MDNode::get(ctx, operands)});
+//     tbaaMetadataMapping.insert({descriptor, llvm::MDNode::get(ctx,
+//     operands)});
 //   });
 
 //   walker.addWalk([&](TBAATagAttr tag) {
@@ -1313,7 +1288,8 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 //         llvm::ConstantInt::get(offsetTy, tag.getOffset())));
 //     if (tag.getConstant())
 //       operands.push_back(
-//           llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(offsetTy, 1)));
+//           llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(offsetTy,
+//           1)));
 
 //     tbaaMetadataMapping.insert({tag, llvm::MDNode::get(ctx, operands)});
 //   });
@@ -1333,8 +1309,8 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 //     llvm::MimIRContext &ctx = llvmModule->getContext();
 //     llvm::NamedMDNode *namedMd =
 //         llvmModule->getOrInsertNamedMetadata(MimIRDialect::getIdentAttrName());
-//     llvm::MDNode *md = llvm::MDNode::get(ctx, llvm::MDString::get(ctx, ident));
-//     namedMd->addOperand(md);
+//     llvm::MDNode *md = llvm::MDNode::get(ctx, llvm::MDString::get(ctx,
+//     ident)); namedMd->addOperand(md);
 //   }
 
 //   return success();
@@ -1364,7 +1340,8 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 //     for (auto libAttr :
 //          cast<ArrayAttr>(dependentLibrariesAttr).getAsRange<StringAttr>()) {
 //       auto *md =
-//           llvm::MDNode::get(ctx, llvm::MDString::get(ctx, libAttr.getValue()));
+//           llvm::MDNode::get(ctx, llvm::MDString::get(ctx,
+//           libAttr.getValue()));
 //       nmd->addOperand(md);
 //     }
 //   }
@@ -1376,7 +1353,8 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 //   LoopAnnotationAttr attr =
 //       TypeSwitch<Operation *, LoopAnnotationAttr>(op)
 //           .Case<MimIR::BrOp, MimIR::CondBrOp>(
-//               [](auto branchOp) { return branchOp.getLoopAnnotationAttr(); });
+//               [](auto branchOp) { return branchOp.getLoopAnnotationAttr();
+//               });
 //   if (!attr)
 //     return;
 //   llvm::MDNode *loopMD =
@@ -1396,7 +1374,8 @@ const mim::Def *ModuleTranslation::convertType(Type type) {
 }
 
 /// A helper to look up remapped operands in the value remapping table.
-SmallVector<const mim::Def *> ModuleTranslation::lookupValues(ValueRange values) {
+SmallVector<const mim::Def *>
+ModuleTranslation::lookupValues(ValueRange values) {
   SmallVector<const mim::Def *> remapped;
   remapped.reserve(values.size());
   for (Value v : values)
@@ -1405,7 +1384,8 @@ SmallVector<const mim::Def *> ModuleTranslation::lookupValues(ValueRange values)
 }
 
 // llvm::DILocation *ModuleTranslation::translateLoc(Location loc,
-//                                                   llvm::DILocalScope *scope) {
+//                                                   llvm::DILocalScope *scope)
+//                                                   {
 //   return debugTranslation->translateLoc(loc, scope);
 // }
 
@@ -1420,7 +1400,8 @@ SmallVector<const mim::Def *> ModuleTranslation::lookupValues(ValueRange values)
 //   return debugTranslation->translateGlobalVariableExpression(attr);
 // }
 
-// llvm::Metadata *ModuleTranslation::translateDebugInfo(MimIR::DINodeAttr attr) {
+// llvm::Metadata *ModuleTranslation::translateDebugInfo(MimIR::DINodeAttr attr)
+// {
 //   return debugTranslation->translate(attr);
 // }
 
@@ -1440,27 +1421,64 @@ SmallVector<const mim::Def *> ModuleTranslation::lookupValues(ValueRange values)
 // }
 
 std::unique_ptr<mim::World> mlir::translateModuleToMimIR(Operation *module,
-                                                   mim::Driver &driver,
-                                                   llvm::StringRef name)
-{
+                                                         mim::Driver &driver,
+                                                         llvm::StringRef name) {
   // if (!satisfiesMimIRModule(module)) {
   //   module->emitOpError("can not be translated to an MimIR module");
   //   return nullptr;
   // }
+  using namespace std::literals;
 
   auto world = std::make_unique<mim::World>(&driver);
+  mim::ast::load_plugins(*world, {"compile"s, "mem"s, "core"s, "math"s,
+                                  "affine"s, "vec"s, "tensor"s, "direct"s});
 
   ModuleTranslation translator(module, driver, std::move(world));
+  std::string s;
+  auto ost = llvm::raw_string_ostream(s);
+  module->print(ost);
+  std::cout << s << std::endl;
+  s = "";
+  auto M = llvm::dyn_cast<ModuleOp>(module);
+  for (auto &Op : M.getOps()) {
+    ost << "Op:\n";
+    Op.print(ost);
+    ost << "\n";
+  }
+
+  for (auto &Attr : M->getAttrs()) {
+    ost << "Attr\n";
+    ost << Attr.getName() << "\n"
+        << Attr.getNameDialect()->getNamespace() << "\n"
+        << Attr.getValue() << "\n";
+  }
+  for (auto &Attr : M->getDialectAttrs()) {
+    ost << "Attr\n";
+    ost << Attr.getName() << "\n"
+        << Attr.getNameDialect()->getNamespace() << "\n"
+        << Attr.getValue() << "\n";
+  }
+
+  for (auto &R : M->getRegions()) {
+    ost << "Region\n";
+    for (auto &B : R) {
+      ost << "Block\n";
+      for (auto &Op : B) {
+        Op.print(ost);
+      }
+    }
+  }
+  std::cout << s << std::endl;
 
   // Convert module before functions and operations inside, so dialect
-  // attributes can be used to change dialect-specific global configurations via
-  // `amendOperation()`. These configurations can then influence the translation
-  // of operations afterwards.
+  // attributes can be used to change dialect-specific global configurations
+  // via `amendOperation()`. These configurations can then influence the
+  // translation of operations afterwards.
   if (failed(translator.convertOperation(*module)))
     return nullptr;
 
-  // if (failed(translator.convertFunctionSignatures()))
-  //   return nullptr;
+  if (failed(translator.convertFunctionSignatures()))
+    return nullptr;
   // if (failed(translator.convertGlobalsAndAliases()))
   //   return nullptr;
   // if (failed(translator.convertIFuncs()))
@@ -1479,19 +1497,19 @@ std::unique_ptr<mim::World> mlir::translateModuleToMimIR(Operation *module,
   // }
   // }
 
-  // Operations in function bodies with symbolic references must be converted
-  // after the top-level operations they refer to are declared, so we do it
-  // last.
-  // if (failed(translator.convertFunctions()))
+  // Operations in function bodies with symbolic references must be
+  // converted after the top-level operations they refer to are declared, so
+  // we do it last.
+  if (failed(translator.convertFunctions()))
+    return nullptr;
+
+  // Now that all MLIR blocks are resolved into MimIR ones, patch block
+  // address constants to point to the correct blocks. if
+  // (failed(translator.convertUnresolvedBlockAddress()))
   //   return nullptr;
 
-  // Now that all MLIR blocks are resolved into MimIR ones, patch block address
-  // constants to point to the correct blocks.
-  // if (failed(translator.convertUnresolvedBlockAddress()))
-  //   return nullptr;
-
-  // Add the necessary debug info module flags, if they were not encoded in MLIR
-  // beforehand.
+  // Add the necessary debug info module flags, if they were not encoded in
+  // MLIR beforehand.
   // translator.debugTranslation->addModuleFlagsIfNotPresent();
 
   return std::move(translator.world_);

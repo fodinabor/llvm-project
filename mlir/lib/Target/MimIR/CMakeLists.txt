@@ -66,7 +66,6 @@ add_mlir_translation_library(MLIRToMimIRTranslationRegistration
   # MLIRVCIXToMimIRTranslation
   # MLIRXeVMToMimIRTranslation
   LINK_LIBS PUBLIC 
-  MLIRBuiltinToMimIRTranslation
   mim::libmim
   )
 

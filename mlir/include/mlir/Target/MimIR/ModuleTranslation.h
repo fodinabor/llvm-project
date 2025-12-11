@@ -15,6 +15,7 @@
 #ifndef MLIR_TARGET_MIMIR_MODULETRANSLATION_H
 #define MLIR_TARGET_MIMIR_MODULETRANSLATION_H
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Value.h"
@@ -43,7 +44,7 @@ namespace MimIR {
 class ModuleTranslation {
   friend std::unique_ptr<mim::World>
   mlir::translateModuleToMimIR(Operation *module, mim::Driver &driver,
-                         llvm::StringRef name);
+                               llvm::StringRef name);
 
 public:
   /// Stores the mapping between a function name and its MimIR IR
@@ -87,7 +88,7 @@ public:
   }
 
   /// Finds an MimIR basic block that corresponds to the given MLIR block.
-  const mim::Lam *lookupBlock(Block *block) const {
+  mim::Lam *lookupBlock(Block *block) const {
     return blockMapping.lookup(block);
   }
 
@@ -254,14 +255,14 @@ private:
   /// definitions, similarly Convert llvm.global_ctors and global_dtors ops.
   /// - Create global alias that correspond to llvm.mlir.alias.
   LogicalResult convertGlobalsAndAliases();
-  // LogicalResult convertOneFunction(MimIRFuncOp func);
+  LogicalResult convertOneFunction(func::FuncOp &func);
   LogicalResult convertBlockImpl(Block &bb, bool ignoreArguments,
                                  bool recordInsertions);
 
   /// Translates dialect attributes attached to the given operation.
   LogicalResult
   convertDialectAttributes(Operation *op,
-                           ArrayRef<const mim::Def *> instructions);
+                           ArrayRef<const mim::Def *> nodes);
 
   /// Translates parameter attributes of a call and adds them to the returned
   /// AttrBuilder. Returns failure if any of the translations failed.
