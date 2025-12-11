@@ -8,11 +8,13 @@
 
 #include "mlir/Target/MimIR/TypeToMimIR.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Diagnostics.h"
 
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #include <mim/plug/math/math.h>
 #include <mim/plug/mem/mem.h>
@@ -53,9 +55,14 @@ public:
             .Case([this](Float64Type) {
               return world.annex<mim::plug::math::F64>();
             })
-            .Case<IntegerType, VectorType, PtrLikeTypeInterface>(
+            .Case<IntegerType, VectorType, PtrLikeTypeInterface, IndexType>(
                 [this](auto type) { return this->translate(type); })
-            .DefaultUnreachable("unknown MimIR dialect type");
+            .Default([](Type type) {
+              llvm::errs() << type << " cannot be converted to MimIR, yet";
+              llvm::llvm_unreachable_internal("not convertible yet");
+              return nullptr;
+            });
+    // .DefaultUnreachable("unknown MimIR dialect type");
 
     // Cache the result of the conversion and return.
     knownTranslations.try_emplace(type, translated);
@@ -83,6 +90,9 @@ private:
            "only signless integer types are supported in MimIR translation");
     return world.type_int(type.getWidth());
   }
+
+  /// Translates the given Index type.
+  const mim::Def *translate(IndexType type) { return world.type_int(64); }
 
   // /// Translates the given pointer type.
   // llvm::Type *translate(MimIR::MimIRPointerType type) {
@@ -116,8 +126,7 @@ private:
 
   /// Translates the given built-in vector type compatible with MimIR.
   const mim::Def *translate(VectorType type) {
-    if (type.isScalable())
-    {
+    if (type.isScalable()) {
       llvm::report_fatal_error(
           "scalable vector types are not yet supported in MimIR translation");
     }

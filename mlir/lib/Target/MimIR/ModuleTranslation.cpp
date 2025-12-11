@@ -26,6 +26,7 @@
 #include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Support/WalkResult.h"
 #include "mlir/Target/MimIR/MimIRTranslationInterface.h"
 #include "mlir/Target/MimIR/TypeToMimIR.h"
 
@@ -53,6 +54,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -1371,6 +1373,26 @@ LogicalResult ModuleTranslation::convertUnresolvedBlockAddress() {
 
 const mim::Def *ModuleTranslation::convertType(Type type) {
   return typeTranslator.translateType(type);
+}
+
+mim::Dbg ModuleTranslation::translateDebugInfo(Location loc) {
+  mim::Dbg dbg;
+  loc->walk([&dbg](Location loc) -> WalkResult {
+    if (auto flcr = dyn_cast<FileLineColRange>(loc)) {
+      // std::filesystem::path file =
+      // std::string(flcr.getFilename().getValue());
+      mim::Pos begin{(uint16_t)flcr.getStartLine(),
+                     (uint16_t)flcr.getStartColumn()};
+      mim::Pos end{(uint16_t)flcr.getEndLine(), (uint16_t)flcr.getEndColumn()};
+      dbg = mim::Loc{/*file,*/ begin, end};
+      return WalkResult::interrupt();
+    }
+    if(auto n = dyn_cast<NameLoc>(loc)) {
+      // dbg = mim::Sym{}
+    }
+    return WalkResult::advance();
+  });
+  return dbg;
 }
 
 /// A helper to look up remapped operands in the value remapping table.

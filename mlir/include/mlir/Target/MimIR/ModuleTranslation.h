@@ -62,7 +62,10 @@ public:
   }
 
   /// Stores the mapping between an MLIR value and its MimIR counterpart.
-  void mapValue(Value mlir, const mim::Def *m) { mapValue(mlir) = m; }
+  void mapValue(Value mlir, const mim::Def *m) {
+    mapValue(mlir) = m;
+    m->set(translateDebugInfo(mlir.getLoc()));
+  }
 
   /// Provides write-once access to store the MimIR IR value corresponding to
   /// the given MLIR value.
@@ -152,6 +155,8 @@ public:
 
   /// Converts the type from MLIR MimIR dialect to MimIR.
   const mim::Def *convertType(Type type);
+
+  mim::Dbg translateDebugInfo(Location loc);
 
   /// Returns the MLIR context of the module being translated.
   MLIRContext &getContext() { return *mlirModule->getContext(); }
@@ -260,9 +265,8 @@ private:
                                  bool recordInsertions);
 
   /// Translates dialect attributes attached to the given operation.
-  LogicalResult
-  convertDialectAttributes(Operation *op,
-                           ArrayRef<const mim::Def *> nodes);
+  LogicalResult convertDialectAttributes(Operation *op,
+                                         ArrayRef<const mim::Def *> nodes);
 
   /// Translates parameter attributes of a call and adds them to the returned
   /// AttrBuilder. Returns failure if any of the translations failed.
