@@ -67,6 +67,7 @@ public:
     m->set(translateDebugInfo(mlir.getLoc()));
   }
 
+private:
   /// Provides write-once access to store the MimIR IR value corresponding to
   /// the given MLIR value.
   const mim::Def *&mapValue(Value value) {
@@ -75,6 +76,7 @@ public:
     return m;
   }
 
+public:
   /// Finds an MimIR IR value corresponding to the given MLIR value.
   const mim::Def *lookupValue(Value value) const {
     return valueMapping.lookup(value);
@@ -343,22 +345,6 @@ void connectPHINodes(Region &region, const ModuleTranslation &state);
 const mim::Def *getMimIRConstant(const mim::Def *type, Attribute attr,
                                  Location loc,
                                  const ModuleTranslation &moduleTranslation);
-
-/// Creates a call to an MimIR IR intrinsic function with the given arguments.
-// const mim::Def *createIntrinsicCall(mim::World &w,
-//                                     llvm::Intrinsic::ID intrinsic,
-//                                     ArrayRef<llvm::Value *> args = {},
-//                                     ArrayRef<llvm::Type *> tys = {});
-
-/// Creates a call to a MimIR IR intrinsic defined by MimIR_IntrOpBase. This
-/// resolves the overloads, and maps mixed MLIR value and attribute arguments to
-/// MimIR values.
-// llvm::CallInst *createIntrinsicCall(
-//     llvm::IRBuilderBase &builder, ModuleTranslation &moduleTranslation,
-//     Operation *intrOp, llvm::Intrinsic::ID intrinsic, unsigned numResults,
-//     ArrayRef<unsigned> overloadedResults, ArrayRef<unsigned>
-//     overloadedOperands, ArrayRef<unsigned> immArgPositions,
-//     ArrayRef<StringLiteral> immArgAttrNames);
 
 } // namespace detail
 

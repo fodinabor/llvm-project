@@ -1377,18 +1377,17 @@ const mim::Def *ModuleTranslation::convertType(Type type) {
 
 mim::Dbg ModuleTranslation::translateDebugInfo(Location loc) {
   mim::Dbg dbg;
-  loc->walk([&dbg](Location loc) -> WalkResult {
+  loc->walk([&dbg, this](Location loc) -> WalkResult {
     if (auto flcr = dyn_cast<FileLineColRange>(loc)) {
       // std::filesystem::path file =
       // std::string(flcr.getFilename().getValue());
       mim::Pos begin{(uint16_t)flcr.getStartLine(),
                      (uint16_t)flcr.getStartColumn()};
       mim::Pos end{(uint16_t)flcr.getEndLine(), (uint16_t)flcr.getEndColumn()};
-      dbg = mim::Loc{/*file,*/ begin, end};
-      return WalkResult::interrupt();
+      dbg = mim::Dbg(mim::Loc{/*file,*/ begin, end}, dbg.sym());
     }
     if(auto n = dyn_cast<NameLoc>(loc)) {
-      // dbg = mim::Sym{}
+      dbg = mim::Dbg(dbg.loc(), world().sym(n.getName().str()));
     }
     return WalkResult::advance();
   });
