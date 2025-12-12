@@ -345,7 +345,7 @@ func.func @minimum(%f1: f32, %f2: f32,
 }
 
 // CHECK-LABEL: @fastmath
-func.func @fastmath(%arg0: f32, %arg1: f32, %arg2: i32) {
+func.func @fastmath(%arg0: f32, %arg1: f32, %arg2: i32) -> i1 {
 // CHECK: {{.*}} = arith.addf %arg0, %arg1 fastmath<fast> : f32
 // CHECK: {{.*}} = arith.subf %arg0, %arg1 fastmath<fast> : f32
 // CHECK: {{.*}} = arith.mulf %arg0, %arg1 fastmath<fast> : f32
@@ -353,21 +353,21 @@ func.func @fastmath(%arg0: f32, %arg1: f32, %arg2: i32) {
 // CHECK: {{.*}} = arith.remf %arg0, %arg1 fastmath<fast> : f32
 // CHECK: {{.*}} = arith.negf %arg0 fastmath<fast> : f32
   %0 = arith.addf %arg0, %arg1 fastmath<fast> : f32
-  %1 = arith.subf %arg0, %arg1 fastmath<fast> : f32
-  %2 = arith.mulf %arg0, %arg1 fastmath<fast> : f32
-  %3 = arith.divf %arg0, %arg1 fastmath<fast> : f32
-  %4 = arith.remf %arg0, %arg1 fastmath<fast> : f32
-// todo:
-//  %5 = arith.negf %arg0 fastmath<fast> : f32
+  %1 = arith.subf %arg0, %0 fastmath<fast> : f32
+  %2 = arith.mulf %arg0, %1 fastmath<fast> : f32
+  %3 = arith.divf %arg0, %2 fastmath<fast> : f32
+  %4 = arith.remf %arg0, %3 fastmath<fast> : f32
+  %5 = arith.negf %4 fastmath<fast> : f32
+  %51 = arith.subf %5, %5 fastmath<fast> : f32
 // CHECK: {{.*}} = arith.addf %arg0, %arg1 : f32
   %6 = arith.addf %arg0, %arg1 fastmath<none> : f32
 // CHECK: {{.*}} = arith.addf %arg0, %arg1 fastmath<nnan,ninf> : f32
-  %7 = arith.addf %arg0, %arg1 fastmath<nnan,ninf> : f32
+  %7 = arith.addf %arg0, %6 fastmath<nnan,ninf> : f32
 // CHECK: {{.*}} = arith.mulf %arg0, %arg1 fastmath<fast> : f32
-  %8 = arith.mulf %arg0, %arg1 fastmath<reassoc,nnan,ninf,nsz,arcp,contract,afn> : f32
+  %8 = arith.mulf %arg0, %7 fastmath<reassoc,nnan,ninf,nsz,arcp,contract,afn> : f32
 // CHECK: {{.*}} = arith.cmpf oeq, %arg0, %arg1 fastmath<fast> : f32
-  %9 = arith.cmpf oeq, %arg0, %arg1 fastmath<fast> : f32
-  return
+  %9 = arith.cmpf oeq, %51, %8 fastmath<fast> : f32
+  return %9 : i1
 }
 
 // CHECK-LABEL: @intflags_func
