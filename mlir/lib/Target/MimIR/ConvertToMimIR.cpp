@@ -16,6 +16,7 @@
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Target/MimIR/Dialect/All.h"
@@ -58,6 +59,7 @@ void registerToMimIRTranslation() {
         registry.insert<DLTIDialect, func::FuncDialect>();
         registry.insert<affine::AffineDialect, arith::ArithDialect>();
         registry.insert<cf::ControlFlowDialect, scf::SCFDialect>();
+        registry.insert<math::MathDialect>();
         registry.insert<tensor::TensorDialect, linalg::LinalgDialect>();
         registerAllToMimIRTranslations(registry);
       });

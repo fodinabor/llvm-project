@@ -19,6 +19,7 @@
 #include "mlir/Target/MimIR/Dialect/ControlFlow/ControlFlowToMimIRTranslation.h"
 #include "mlir/Target/MimIR/Dialect/Func/FuncToMimIRTranslation.h"
 #include "mlir/Target/MimIR/Dialect/Linalg/LinalgToMimIRTranslation.h"
+#include "mlir/Target/MimIR/Dialect/Math/MathToMimIRTranslation.h"
 #include "mlir/Target/MimIR/Dialect/SCF/SCFToMimIRTranslation.h"
 #include "mlir/Target/MimIR/Dialect/Tensor/TensorToMimIRTranslation.h"
 
@@ -33,6 +34,7 @@ static inline void registerAllToMimIRTranslations(DialectRegistry &registry) {
   registerControlFlowDialectTranslationMimIR(registry);
   registerFuncDialectTranslationMimIR(registry);
   registerLinalgDialectTranslationMimIR(registry);
+  registerMathDialectTranslationMimIR(registry);
   registerSCFDialectTranslationMimIR(registry);
   registerTensorDialectTranslationMimIR(registry);
 }
