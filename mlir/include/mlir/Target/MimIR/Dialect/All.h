@@ -18,6 +18,8 @@
 #include "mlir/Target/MimIR/Dialect/Builtin/BuiltinToMimIRTranslation.h"
 #include "mlir/Target/MimIR/Dialect/ControlFlow/ControlFlowToMimIRTranslation.h"
 #include "mlir/Target/MimIR/Dialect/Func/FuncToMimIRTranslation.h"
+#include "mlir/Target/MimIR/Dialect/Linalg/LinalgToMimIRTranslation.h"
+#include "mlir/Target/MimIR/Dialect/Tensor/TensorToMimIRTranslation.h"
 
 namespace mlir {
 class DialectRegistry;
@@ -29,6 +31,8 @@ static inline void registerAllToMimIRTranslations(DialectRegistry &registry) {
   registerBuiltinDialectTranslationMimIR(registry);
   registerControlFlowDialectTranslationMimIR(registry);
   registerFuncDialectTranslationMimIR(registry);
+  registerLinalgDialectTranslationMimIR(registry);
+  registerTensorDialectTranslationMimIR(registry);
 }
 
 /// Registers all the translations to MIM IR required by GPU passes.

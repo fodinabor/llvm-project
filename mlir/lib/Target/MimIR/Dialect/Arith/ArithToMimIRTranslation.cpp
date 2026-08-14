@@ -12,7 +12,9 @@
 #include "mlir/Target/MimIR/Dialect/Arith/ArithToMimIRTranslation.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/Target/MimIR/MimIRTranslationInterface.h"
 #include "mlir/Target/MimIR/ModuleTranslation.h"
 
@@ -414,6 +416,36 @@ public:
     return success();
   }
 
+  /// Builds a nested tuple of the given shape from a flat list of elements
+  /// (row-major), consuming `elems` from the front.
+  const mim::Def *buildNestedTuple(ArrayRef<int64_t> shape,
+                                   ArrayRef<const mim::Def *> &elems) {
+    if (shape.empty()) {
+      const auto *elem = elems.front();
+      elems = elems.drop_front();
+      return elem;
+    }
+    mim::DefVec rows;
+    for (int64_t i = 0; i < shape.front(); ++i)
+      rows.push_back(buildNestedTuple(shape.drop_front(), elems));
+    return world_.tuple(mim::Defs{rows});
+  }
+
+  /// Creates a MimIR literal of `elemType` from the raw bits of one element.
+  const mim::Def *elementLit(const mim::Def *elemType, const llvm::APInt &bits) {
+    return world_.lit(elemType, bits.getZExtValue());
+  }
+
+  /// Translates a dense elements constant into a (nested) tuple or pack.
+  LogicalResult convertDenseConstant(arith::ConstantOp &op,
+                                     ShapedType shapedType,
+                                     ArrayRef<const mim::Def *> elems) {
+    ArrayRef<const mim::Def *> rest = elems;
+    const auto *result = buildNestedTuple(shapedType.getShape(), rest);
+    moduleTranslation_.mapValue(op.getResult(), result);
+    return success();
+  }
+
   // special ops
   // int/float constant
   LogicalResult operator()(arith::ConstantOp &op) {
@@ -433,7 +465,58 @@ public:
       moduleTranslation_.mapValue(op.getResult(), lit);
       return success();
     }
-    return failure();
+    if (auto denseAttr = dyn_cast<DenseElementsAttr>(op.getValue())) {
+      auto shapedType = cast<ShapedType>(op.getType());
+      if (!shapedType.hasStaticShape())
+        return op.emitError("dynamic shapes are not supported");
+      const auto *elemType =
+          moduleTranslation_.convertType(shapedType.getElementType());
+
+      if (denseAttr.isSplat()) {
+        const auto *lit = elementLit(
+            elemType, denseAttr.getSplatValue<APInt>());
+        mim::Vector<mim::u64> dims;
+        for (int64_t dim : shapedType.getShape())
+          dims.push_back(dim);
+        moduleTranslation_.mapValue(op.getResult(), world_.pack(dims, lit));
+        return success();
+      }
+
+      SmallVector<const mim::Def *> elems;
+      for (const APInt &bits : denseAttr.getValues<APInt>())
+        elems.push_back(elementLit(elemType, bits));
+      return convertDenseConstant(op, shapedType, elems);
+    }
+    if (auto resourceAttr =
+            dyn_cast<DenseResourceElementsAttr>(op.getValue())) {
+      auto shapedType = cast<ShapedType>(op.getType());
+      if (!shapedType.hasStaticShape())
+        return op.emitError("dynamic shapes are not supported");
+      const auto *elemType =
+          moduleTranslation_.convertType(shapedType.getElementType());
+
+      AsmResourceBlob *blob = resourceAttr.getRawHandle().getBlob();
+      if (!blob)
+        return op.emitError("resource blob is not available");
+      ArrayRef<char> data = blob->getData();
+      unsigned bitWidth = shapedType.getElementType().getIntOrFloatBitWidth();
+      unsigned byteWidth = bitWidth / 8;
+      if (byteWidth == 0 || data.size() % byteWidth != 0)
+        return op.emitError("unsupported resource element width");
+
+      SmallVector<const mim::Def *> elems;
+      for (size_t offset = 0; offset < data.size(); offset += byteWidth) {
+        uint64_t bits = 0;
+        // Resource blobs store elements in little-endian order.
+        for (unsigned b = 0; b < byteWidth; ++b)
+          bits |= uint64_t(uint8_t(data[offset + b])) << (8 * b);
+        elems.push_back(elementLit(elemType, llvm::APInt(64, bits)));
+      }
+      if (elems.size() != size_t(shapedType.getNumElements()))
+        return op.emitError("resource size does not match tensor shape");
+      return convertDenseConstant(op, shapedType, elems);
+    }
+    return op.emitError("unsupported constant attribute in MimIR translation");
   }
 
   // (ff, tt)#cond

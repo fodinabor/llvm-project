@@ -1,8 +1,39 @@
-// RUN: mlir-translate --mlir-to-mim %s -split-input-file | FileCheck %s
-// Translating tensor/linalg ops to MimIR is not implemented yet.
-// XFAIL: *
+// RUN: mlir-translate --mlir-to-mim %s | FileCheck %s
 
-// CHECK: main
+// A small PyTorch linear + ReLU model: checks that linalg lowers to the
+// high-level SSA-world axioms of MimIR's tensor plugin.
+
+// CHECK-LABEL: fun extern main (
+
+// linalg.matmul becomes %tensor.dot_product over a float ring, contracting
+// dim 1 of the input with dim 0 of the (transposed) weight; the zero-filled
+// `outs` tensor is elided. The transpose is a map_reduce with a swapped read
+// map, its input the dense resource weights (first element 0xBE4F96D4).
+// CHECK: %tensor.dot_product (%math.F (23, 8), 0:(%math.F (23, 8)), ring_fadd_{{[0-9]+}}, ring_fmul_{{[0-9]+}}) ‹2; 2› (1, 0) (tt, ff, (), ())
+// CHECK-SAME: %tensor.map_reduce 1
+// CHECK-SAME: transpose_copy
+// CHECK-SAME: 3192886996:(%math.F (23, 8))
+
+// The bias addition: a two-input map_reduce whose second input is the
+// rank-1 bias (first element 0x3E62E4F8) read through a broadcast map.
+// CHECK: %tensor.map_reduce 2 (%math.F (23, 8), 2, 0)
+// CHECK-SAME: linalg_body_
+// CHECK-SAME: 1046668536:(%math.F (23, 8))
+
+// The ReLU: a single-input elementwise map_reduce.
+// CHECK: %tensor.map_reduce 1 (%math.F (23, 8), 2, 0)
+// CHECK-SAME: linalg_body_
+
+// The fold functions and ring operations.
+// CHECK: fun transpose_copy_{{[0-9]+}}
+// CHECK: lam ring_fadd_{{[0-9]+}}
+// CHECK: %math.arith.add (23, 8) 0
+// CHECK: lam ring_fmul_{{[0-9]+}}
+// CHECK: %math.arith.mul (23, 8) 0
+// CHECK: fun linalg_body_{{[0-9]+}}
+// CHECK: %math.arith.add (23, 8) 0
+// CHECK: fun linalg_body_{{[0-9]+}}
+// CHECK: %math.cmp.UGle (23, 8) 0
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map1 = affine_map<(d0, d1) -> (d1)>
