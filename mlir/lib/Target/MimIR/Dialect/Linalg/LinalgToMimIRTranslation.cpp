@@ -259,44 +259,73 @@ public:
     return success();
   }
 
-  // linalg.matmul: %tensor.dot_product over a %tensor.Ring, contracting the
-  // second dimension of the left with the first dimension of the right input.
-  LogicalResult operator()(linalg::MatmulOp op) {
+  /// Builds a `«n; Idx rank»` tuple of index literals.
+  const mim::Def *idxTuple(uint64_t rank, ArrayRef<int64_t> dims) {
+    mim::DefVec idxs;
+    for (int64_t d : dims)
+      idxs.push_back(world_.lit_idx(rank, d));
+    return world_.tuple(mim::Defs{idxs});
+  }
+
+  /// Translates a contraction (matmul, batch_matmul, matvec, dot) into
+  /// %tensor.dot_product with the given contracting (`c1`/`c2`) and batching
+  /// (`b1`/`b2`) dimensions of the two inputs.
+  template <class ContractionOp>
+  LogicalResult convertDotLike(ContractionOp op, ArrayRef<int64_t> c1,
+                               ArrayRef<int64_t> c2, ArrayRef<int64_t> b1,
+                               ArrayRef<int64_t> b2) {
     auto lhsType = dyn_cast<RankedTensorType>(op.getInputs()[0].getType());
     auto rhsType = dyn_cast<RankedTensorType>(op.getInputs()[1].getType());
-    if (!lhsType || !rhsType || lhsType.getRank() != 2 ||
-        rhsType.getRank() != 2 || !lhsType.hasStaticShape() ||
+    if (!lhsType || !rhsType || !lhsType.hasStaticShape() ||
         !rhsType.hasStaticShape())
-      return op.emitError("expected statically shaped 2-d tensor operands");
+      return op.emitError("expected statically shaped tensor operands");
     const auto *lhs = moduleTranslation_.lookupValue(op.getInputs()[0]);
     const auto *rhs = moduleTranslation_.lookupValue(op.getInputs()[1]);
     const auto *init = moduleTranslation_.lookupValue(op.getOutputs()[0]);
     if (!lhs || !rhs || !init)
-      return op.emitError("failed to lookup matmul operands");
+      return op.emitError("failed to lookup contraction operands");
+
+    // The contraction accumulates onto its `outs` operand; elide the addition
+    // when the initial value cannot contribute.
+    if (!isZeroOrUndef(init))
+      return op.emitError(
+          "only zero-initialized `outs` operands are supported");
 
     auto ring = ringFor(op, lhsType.getElementType());
     if (failed(ring))
       return failure();
 
+    uint64_t r1 = lhsType.getRank(), r2 = rhsType.getRank();
     const auto *dp = world_.annex<mim::plug::tensor::dot_product>();
     dp = world_.app(dp, *ring);
-    dp = world_.app(dp, mim::Defs{world_.lit_nat(2), world_.lit_nat(2)});
-    dp = world_.app(dp, mim::Defs{world_.lit_nat(1), world_.lit_nat(0)});
-    // Contract lhs dim 1 with rhs dim 0; no batch dims.
-    const auto *emptyIdxTuple = world_.tuple(mim::Defs{});
-    dp = world_.app(dp, mim::Defs{world_.lit_idx(2, 1), world_.lit_idx(2, 0),
-                                  emptyIdxTuple, emptyIdxTuple});
+    dp = world_.app(dp, mim::Defs{world_.lit_nat(r1), world_.lit_nat(r2)});
+    dp = world_.app(dp, mim::Defs{world_.lit_nat(c1.size()),
+                                  world_.lit_nat(b1.size())});
+    dp = world_.app(dp, mim::Defs{idxTuple(r1, c1), idxTuple(r2, c2),
+                                  idxTuple(r1, b1), idxTuple(r2, b2)});
     dp = world_.app(dp, mim::Defs{natTuple(lhsType.getShape()),
                                   natTuple(rhsType.getShape())});
     const auto *product = world_.app(dp, mim::Defs{lhs, rhs});
 
-    // linalg.matmul accumulates onto its `outs` operand. Elide the addition
-    // when the initial value cannot contribute.
-    if (!isZeroOrUndef(init))
-      return op.emitError(
-          "only zero-initialized `outs` operands are supported");
     moduleTranslation_.mapValue(op.getResult(0), product);
     return success();
+  }
+
+  // linalg.matmul: contract dim 1 of the left with dim 0 of the right input.
+  LogicalResult operator()(linalg::MatmulOp op) {
+    return convertDotLike(op, {1}, {0}, {}, {});
+  }
+  // linalg.batch_matmul: additionally batch over dim 0 of both inputs.
+  LogicalResult operator()(linalg::BatchMatmulOp op) {
+    return convertDotLike(op, {2}, {1}, {0}, {0});
+  }
+  // linalg.matvec: contract dim 1 of the matrix with the vector.
+  LogicalResult operator()(linalg::MatvecOp op) {
+    return convertDotLike(op, {1}, {0}, {}, {});
+  }
+  // linalg.dot: contract the two vectors to a scalar.
+  LogicalResult operator()(linalg::DotOp op) {
+    return convertDotLike(op, {0}, {0}, {}, {});
   }
 
   // linalg.generic: %tensor.map_reduce with the body region as fold function.
@@ -436,7 +465,8 @@ public:
     LinalgToMimIRVisitor visitor{world, moduleTranslation};
     return llvm::TypeSwitch<Operation *, LogicalResult>(op)
         .Case<linalg::YieldOp, linalg::FillOp, linalg::TransposeOp,
-              linalg::MatmulOp, linalg::GenericOp>(
+              linalg::MatmulOp, linalg::BatchMatmulOp, linalg::MatvecOp,
+              linalg::DotOp, linalg::GenericOp>(
             [&](auto typedOp) { return visitor(typedOp); })
         .Default([&](Operation *) { return visitor(op); });
   }
