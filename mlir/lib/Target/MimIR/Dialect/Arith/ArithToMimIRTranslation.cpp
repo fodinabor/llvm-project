@@ -20,7 +20,8 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/LogicalResult.h"
 
-#include <fe/enum.h>
+#include <utility>
+
 #include <mim/plug/core/autogen.h>
 #include <mim/plug/core/core.h>
 #include <mim/plug/math/autogen.h>
@@ -34,17 +35,12 @@ namespace {
 using namespace mim::plug;
 
 core::Mode convertOverflowToMimMode(arith::IntegerOverflowFlags flags) {
-  if (flags ==
-      (arith::IntegerOverflowFlags::nsw | arith::IntegerOverflowFlags::nuw))
-    return core::Mode::nusw;
-  switch (flags) {
-  case arith::IntegerOverflowFlags::none:
-    return core::Mode::none;
-  case arith::IntegerOverflowFlags::nsw:
-    return core::Mode::nsw;
-  case arith::IntegerOverflowFlags::nuw:
-    return core::Mode::nuw;
-  }
+  mim::nat_t mode = std::to_underlying(core::Mode::none);
+  if (bitEnumContainsAll(flags, arith::IntegerOverflowFlags::nsw))
+    mode |= std::to_underlying(core::Mode::nsw);
+  if (bitEnumContainsAll(flags, arith::IntegerOverflowFlags::nuw))
+    mode |= std::to_underlying(core::Mode::nuw);
+  return (core::Mode)mode;
 }
 
 core::icmp convertCmpPredicate(arith::CmpIPredicate pred) {
@@ -73,26 +69,19 @@ core::icmp convertCmpPredicate(arith::CmpIPredicate pred) {
 }
 
 math::Mode convertFastMathToMimMode(arith::FastMathFlags flags) {
-  using namespace fe;
-  mim::nat_t mode = (mim::nat_t)math::Mode::none;
-  if (bitEnumContainsAll(flags, arith::FastMathFlags::none))
-    mode = mode | math::Mode::none;
-  if (bitEnumContainsAll(flags, arith::FastMathFlags::reassoc))
-    mode = mode | math::Mode::reassoc;
-  if (bitEnumContainsAll(flags, arith::FastMathFlags::nnan))
-    mode = mode | math::Mode::nnan;
-  if (bitEnumContainsAll(flags, arith::FastMathFlags::ninf))
-    mode = mode | math::Mode::ninf;
-  if (bitEnumContainsAll(flags, arith::FastMathFlags::nsz))
-    mode = mode | math::Mode::nsz;
-  if (bitEnumContainsAll(flags, arith::FastMathFlags::arcp))
-    mode = mode | math::Mode::arcp;
-  if (bitEnumContainsAll(flags, arith::FastMathFlags::contract))
-    mode = mode | math::Mode::contract;
-  if (bitEnumContainsAll(flags, arith::FastMathFlags::afn))
-    mode = mode | math::Mode::afn;
-  if (bitEnumContainsAll(flags, arith::FastMathFlags::fast))
-    mode = mode | math::Mode::fast;
+  mim::nat_t mode = std::to_underlying(math::Mode::none);
+  auto set = [&](arith::FastMathFlags flag, math::Mode m) {
+    if (bitEnumContainsAll(flags, flag))
+      mode |= std::to_underlying(m);
+  };
+  set(arith::FastMathFlags::reassoc, math::Mode::reassoc);
+  set(arith::FastMathFlags::nnan, math::Mode::nnan);
+  set(arith::FastMathFlags::ninf, math::Mode::ninf);
+  set(arith::FastMathFlags::nsz, math::Mode::nsz);
+  set(arith::FastMathFlags::arcp, math::Mode::arcp);
+  set(arith::FastMathFlags::contract, math::Mode::contract);
+  set(arith::FastMathFlags::afn, math::Mode::afn);
+  set(arith::FastMathFlags::fast, math::Mode::fast);
   return (math::Mode)mode;
 }
 
@@ -134,7 +123,6 @@ math::cmp convertFCmpPredicate(arith::CmpFPredicate pred) {
 }
 
 // TODO: no tensor/vector variants supported thus far!
-// TODO: no integer div/rem support so far, missing mem!!
 class ArithToMimIRVisitor {
 public:
   ArithToMimIRVisitor(mim::World &world,
@@ -187,6 +175,37 @@ public:
   }
   LogicalResult operator()(arith::ShRSIOp &op) {
     return convertBinaryOp(op, core::shr::a);
+  }
+
+  // core.div.(sdiv, udiv, srem, urem): division by zero is a visible side
+  // effect, so these consume and produce the current `%mem.M` token.
+  template <class DivOp>
+  LogicalResult convertDivOp(DivOp &op, core::div mimId) {
+    const auto *lhs = moduleTranslation_.lookupValue(op.getLhs());
+    const auto *rhs = moduleTranslation_.lookupValue(op.getRhs());
+    if (!lhs || !rhs)
+      return op.emitError("failed to lookup operands in MimIR translation");
+
+    const auto *memAndResult =
+        world_.call(mimId, mim::Defs{moduleTranslation_.currentMem(),
+                                     world_.tuple({lhs, rhs})});
+    moduleTranslation_.setCurrentMem(world_.extract(memAndResult, mim::u64(0)));
+    moduleTranslation_.mapValue(op.getResult(),
+                                world_.extract(memAndResult, mim::u64(1)));
+    return success();
+  }
+
+  LogicalResult operator()(arith::DivSIOp &op) {
+    return convertDivOp(op, core::div::sdiv);
+  }
+  LogicalResult operator()(arith::DivUIOp &op) {
+    return convertDivOp(op, core::div::udiv);
+  }
+  LogicalResult operator()(arith::RemSIOp &op) {
+    return convertDivOp(op, core::div::srem);
+  }
+  LogicalResult operator()(arith::RemUIOp &op) {
+    return convertDivOp(op, core::div::urem);
   }
 
   template <class WrapOp>

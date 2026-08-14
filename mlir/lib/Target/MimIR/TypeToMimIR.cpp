@@ -55,7 +55,8 @@ public:
             .Case([this](Float64Type) {
               return world.annex<mim::plug::math::F64>();
             })
-            .Case<IntegerType, VectorType, PtrLikeTypeInterface, IndexType>(
+            .Case<IntegerType, VectorType, RankedTensorType,
+                  PtrLikeTypeInterface, IndexType>(
                 [this](auto type) { return this->translate(type); })
             .Default([](Type type) {
               llvm::errs() << type << " cannot be converted to MimIR, yet";
@@ -136,6 +137,18 @@ private:
       assert(dim >= 0 && "expected static vector dimension");
       dims.push_back(dim);
     }
+    return world.arr(dims, translateType(type.getElementType()));
+  }
+
+  /// Translates the given ranked tensor type to a (nested) MimIR array.
+  const mim::Def *translate(RankedTensorType type) {
+    if (!type.hasStaticShape()) {
+      llvm::report_fatal_error(
+          "dynamic tensor shapes are not yet supported in MimIR translation");
+    }
+    mim::Vector<mim::u64> dims;
+    for (auto dim : type.getShape())
+      dims.push_back(dim);
     return world.arr(dims, translateType(type.getElementType()));
   }
 

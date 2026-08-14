@@ -16,6 +16,9 @@ if(NOT LLVM_ENABLE_RTTI)
   message(FATAL_ERROR "MimIR target requires RTTI. Please enable LLVM_ENABLE_RTTI.")
 endif()
 
+# The abseil targets exported by the MimIR install may reference GTest::gmock
+# (absl was built with testing enabled), so GTest must be found first.
+find_package(GTest CONFIG QUIET)
 find_package(Mim CONFIG REQUIRED)
 
 add_mlir_translation_library(MLIRTargetMimIRExport
@@ -39,7 +42,10 @@ add_mlir_translation_library(MLIRTargetMimIRExport
   TargetParser
 
   LINK_LIBS PUBLIC
+  MLIRArithDialect
+  MLIRControlFlowDialect
   MLIRDLTIDialect
+  MLIRFuncDialect
   MLIRTranslateLib
   MLIRTransformUtils
   mim::libmim

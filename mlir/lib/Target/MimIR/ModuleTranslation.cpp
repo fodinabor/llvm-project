@@ -64,11 +64,12 @@
 #include <mim/ast/ast.h>
 #include <mim/ast/parser.h>
 #include <mim/def.h>
+#include <mim/plug/mem/mem.h>
 #include <mim/plugin.h>
 
 #include <string>
 
-#define DEBUG_TYPE "llvm-dialect-to-llvm-ir"
+#define DEBUG_TYPE "mlir-to-mimir"
 
 using namespace mlir;
 using namespace mlir::MimIR;
@@ -199,17 +200,19 @@ LogicalResult ModuleTranslation::convertBlockImpl(Block &bb,
   // builder.SetInsertPoint(lookupBlock(&bb));
   // auto *subprogram = builder.GetInsertBlock()->getParent()->getSubprogram();
   mim::Lam *l = lookupBlock(&bb);
+  setCurrentLam(l);
+  // The mem token is the first parameter of every function and basic-block
+  // lambda.
+  setCurrentMem(l->var(mim::nat_t(0)));
 
   // Before traversing operations, make block arguments available through
-  // value remapping and PHI nodes, but do not add incoming edges for the PHI
-  // nodes just yet: those values may be defined by this or following blocks.
-  // This step is omitted if "ignoreArguments" is set.  The arguments of the
-  // first block have been already made available through the remapping of
-  // MimIR function arguments.
+  // value remapping, mapping them to the vars of the block's lambda (offset
+  // by one for the mem token). This step is omitted if "ignoreArguments" is
+  // set. The arguments of the entry block have been already made available
+  // through the remapping of MimIR function arguments.
   if (!ignoreArguments) {
-    for (auto [arg, var] : llvm::zip(bb.getArguments(), l->vars())) {
-      mapValue(arg, var);
-    }
+    for (auto [index, arg] : llvm::enumerate(bb.getArguments()))
+      mapValue(arg, l->var(index + 1));
   }
 
   // Traverse operations.
@@ -693,17 +696,25 @@ LogicalResult ModuleTranslation::convertOneFunction(func::FuncOp &func) {
   branchMapping.clear();
   mim::Lam *lam = lookupFunction(func.getName());
 
-  // Add function arguments to the value remapping table.
-  for (auto [mlirArg, mimVar] : llvm::zip(func.getArguments(), lam->vars()))
-    mapValue(mlirArg, mimVar);
+  // Add function arguments to the value remapping table. The lambda's first
+  // var is the `%mem.M` token, its last var the return continuation.
+  for (auto [index, mlirArg] : llvm::enumerate(func.getArguments()))
+    mapValue(mlirArg, lam->var(index + 1));
 
-  // First, create all blocks so we can jump to them.
-  for (auto &bb : func) {
-    mim::DefVec blockArgTypes{bb.getArguments(), [this](Value v) {
-                                return convertType(v.getType());
-                              }};
-    // todo: do we need a cn for the successors?
-    auto *newBlock = world_->mut_con(blockArgTypes);
+  // First, create all blocks so we can jump to them. The entry block is the
+  // function's lambda itself; each other block becomes a basic-block lambda
+  // (a continuation taking the mem token and the block arguments).
+  for (auto [index, bb] : llvm::enumerate(func.getBody())) {
+    if (bb.isEntryBlock()) {
+      mapBlock(&bb, lam);
+      continue;
+    }
+    mim::DefVec blockArgTypes{memType()};
+    for (Value v : bb.getArguments())
+      blockArgTypes.push_back(convertType(v.getType()));
+    auto *newBlock = world_->mut_con(blockArgTypes)
+                         ->set(func.getName().str() + ".bb" +
+                               std::to_string(index));
     mapBlock(&bb, newBlock);
   }
 
@@ -941,10 +952,15 @@ LogicalResult ModuleTranslation::convertFunctionSignatures() {
   // Declare all functions first because there may be function calls that form a
   // call graph with cycles, or global initializers that reference functions.
   for (auto function : getModuleBody(mlirModule).getOps<func::FuncOp>()) {
-    mim::DefVec lamArgTypes{function.getArgumentTypes(),
-                            [this](Type t) { return convertType(t); }};
-    mim::DefVec conArgTypes{function.getFunctionType().getResults(),
-                            [this](Type t) { return convertType(t); }};
+    // A function `(args...) -> (results...)` becomes a continuation
+    // `Cn [%mem.M, args..., Cn [%mem.M, results...]]`: the memory token is
+    // threaded through every function and its return continuation.
+    mim::DefVec lamArgTypes{memType()};
+    for (Type t : function.getArgumentTypes())
+      lamArgTypes.push_back(convertType(t));
+    mim::DefVec conArgTypes{memType()};
+    for (Type t : function.getFunctionType().getResults())
+      conArgTypes.push_back(convertType(t));
     const auto *retCn = world_->cn(conArgTypes);
     lamArgTypes.push_back(retCn);
     auto *lam =
@@ -1375,6 +1391,10 @@ const mim::Def *ModuleTranslation::convertType(Type type) {
   return typeTranslator.translateType(type);
 }
 
+const mim::Def *ModuleTranslation::memType() {
+  return world_->call<mim::plug::mem::M>(mim::nat_t(0));
+}
+
 mim::Dbg ModuleTranslation::translateDebugInfo(Location loc) {
   mim::Dbg dbg;
   loc->walk([&dbg, this](Location loc) -> WalkResult {
@@ -1450,46 +1470,12 @@ std::unique_ptr<mim::World> mlir::translateModuleToMimIR(Operation *module,
   // }
   using namespace std::literals;
 
-  auto world = std::make_unique<mim::World>(&driver);
-  mim::ast::load_plugins(*world, {"compile"s, "mem"s, "core"s, "math"s,
-                                  "affine"s, "vec"s, "tensor"s, "direct"s});
+  auto world = std::make_unique<mim::World>(&driver, driver.sym(name.str()));
+  mim::ast::load_plugins(
+      *world, {"compile"s, "mem"s, "core"s, "math"s, "affine"s, "vec"s,
+               "tensor"s});
 
   ModuleTranslation translator(module, driver, std::move(world));
-  std::string s;
-  auto ost = llvm::raw_string_ostream(s);
-  module->print(ost);
-  std::cout << s << std::endl;
-  s = "";
-  auto M = llvm::dyn_cast<ModuleOp>(module);
-  for (auto &Op : M.getOps()) {
-    ost << "Op:\n";
-    Op.print(ost);
-    ost << "\n";
-  }
-
-  for (auto &Attr : M->getAttrs()) {
-    ost << "Attr\n";
-    ost << Attr.getName() << "\n"
-        << Attr.getNameDialect()->getNamespace() << "\n"
-        << Attr.getValue() << "\n";
-  }
-  for (auto &Attr : M->getDialectAttrs()) {
-    ost << "Attr\n";
-    ost << Attr.getName() << "\n"
-        << Attr.getNameDialect()->getNamespace() << "\n"
-        << Attr.getValue() << "\n";
-  }
-
-  for (auto &R : M->getRegions()) {
-    ost << "Region\n";
-    for (auto &B : R) {
-      ost << "Block\n";
-      for (auto &Op : B) {
-        Op.print(ost);
-      }
-    }
-  }
-  std::cout << s << std::endl;
 
   // Convert module before functions and operations inside, so dialect
   // attributes can be used to change dialect-specific global configurations

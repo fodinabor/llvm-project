@@ -97,6 +97,27 @@ public:
     return blockMapping.lookup(block);
   }
 
+  /// Returns the MimIR lambda new expressions are currently emitted into.
+  /// This starts out as the lambda of the block being converted, but ops that
+  /// require CPS-style sequencing (e.g. calls) may replace it with a freshly
+  /// created continuation holding the rest of the block.
+  mim::Lam *currentLam() const { return curLam; }
+
+  /// Sets the MimIR lambda new expressions are emitted into.
+  void setCurrentLam(mim::Lam *lam) { curLam = lam; }
+
+  /// Returns the current `%mem.M` token. Every function, basic block, and
+  /// return continuation receives a mem token as its first parameter;
+  /// operations with side effects consume the current token and register the
+  /// resulting one via setCurrentMem().
+  const mim::Def *currentMem() const { return curMem; }
+
+  /// Sets the current `%mem.M` token.
+  void setCurrentMem(const mim::Def *mem) { curMem = mem; }
+
+  /// Returns the `%mem.M 0` type.
+  const mim::Def *memType();
+
   /// Stores the mapping between an MLIR operation with successors and a
   /// corresponding MimIR instruction.
   void mapBranch(Operation *mlir, const mim::Def *m) {
@@ -307,6 +328,12 @@ private:
   /// A dialect interface collection used for dispatching the translation to
   /// specific dialects.
   MimIRTranslationInterface iface;
+
+  /// The lambda new expressions are currently emitted into. See currentLam().
+  mim::Lam *curLam = nullptr;
+
+  /// The current `%mem.M` token. See currentMem().
+  const mim::Def *curMem = nullptr;
 
   /// Mappings between original and translated values, used for lookups.
   llvm::StringMap<mim::Lam *> functionMapping;

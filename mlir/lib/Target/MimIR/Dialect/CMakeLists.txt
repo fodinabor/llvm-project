@@ -1,3 +1,4 @@
 add_subdirectory(Arith)
 add_subdirectory(Builtin)
+add_subdirectory(ControlFlow)
 add_subdirectory(Func)

@@ -12,6 +12,7 @@
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -35,7 +36,7 @@ void registerToMimIRTranslation() {
       [](Operation *op, raw_ostream &output) {
         try {
           mim::Driver driver;
-          driver.log().set(&std::cerr).set(mim::Log::Level::Debug);
+          driver.log().set(&std::cerr).set(mim::Log::Level::Error);
 
           auto world = translateModuleToMimIR(op, driver);
           if (!world)
@@ -55,6 +56,7 @@ void registerToMimIRTranslation() {
       [](DialectRegistry &registry) {
         registry.insert<DLTIDialect, func::FuncDialect>();
         registry.insert<affine::AffineDialect, arith::ArithDialect>();
+        registry.insert<cf::ControlFlowDialect>();
         registry.insert<tensor::TensorDialect, linalg::LinalgDialect>();
         registerAllToMimIRTranslations(registry);
       });

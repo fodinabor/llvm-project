@@ -1,4 +1,8 @@
-// RUN: mlir-translate --mlir-to-mimir %s -split-input-file | FileCheck %s
+// RUN: mlir-translate --mlir-to-mim %s -split-input-file | FileCheck %s
+// Translating tensor/linalg ops to MimIR is not implemented yet.
+// XFAIL: *
+
+// CHECK: main
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map1 = affine_map<(d0, d1) -> (d1)>

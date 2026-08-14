@@ -15,8 +15,9 @@
 #define MLIR_TARGET_MIMIR_DIALECT_ALL_H
 
 #include "mlir/Target/MimIR/Dialect/Arith/ArithToMimIRTranslation.h"
-#include "mlir/Target/MimIR/Dialect/Func/FuncToMimIRTranslation.h"
 #include "mlir/Target/MimIR/Dialect/Builtin/BuiltinToMimIRTranslation.h"
+#include "mlir/Target/MimIR/Dialect/ControlFlow/ControlFlowToMimIRTranslation.h"
+#include "mlir/Target/MimIR/Dialect/Func/FuncToMimIRTranslation.h"
 
 namespace mlir {
 class DialectRegistry;
@@ -26,6 +27,7 @@ class DialectRegistry;
 static inline void registerAllToMimIRTranslations(DialectRegistry &registry) {
   registerArithDialectTranslationMimIR(registry);
   registerBuiltinDialectTranslationMimIR(registry);
+  registerControlFlowDialectTranslationMimIR(registry);
   registerFuncDialectTranslationMimIR(registry);
 }
 
@@ -36,8 +38,8 @@ static inline void
 registerAllGPUToMimIRTranslations(DialectRegistry &registry) {
   registerArithDialectTranslationMimIR(registry);
   registerBuiltinDialectTranslationMimIR(registry);
+  registerControlFlowDialectTranslationMimIR(registry);
   registerFuncDialectTranslationMimIR(registry);
-
 }
 
 } // namespace mlir
