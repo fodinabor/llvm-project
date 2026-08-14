@@ -70,6 +70,30 @@ func.func @test_access(%t : tensor<2x3xf32>, %i : index, %j : index, %v : f32) -
   return %1 : f32
 }
 
+#conv_in = affine_map<(d0, d1) -> (d0 * 2 + d1)>
+#conv_krn = affine_map<(d0, d1) -> (d1)>
+#conv_out = affine_map<(d0, d1) -> (d0)>
+
+// A strided 1-d convolution as linalg.generic: the input read map
+// `d0 * 2 + d1` becomes a lambda over %affine.semiop.mul / %affine.op.add.
+// CHECK-LABEL: fun extern test_conv1d (
+// CHECK: %tensor.map_reduce 2 (%math.F (23, 8), 1, 1) (4, (4, 3))
+// CHECK-SAME: affine_map_
+func.func @test_conv1d(%in : tensor<9xf32>, %krn : tensor<3xf32>) -> tensor<4xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<4xf32>
+  %1 = linalg.fill ins(%cst : f32) outs(%0 : tensor<4xf32>) -> tensor<4xf32>
+  %2 = linalg.generic {indexing_maps = [#conv_in, #conv_krn, #conv_out],
+                       iterator_types = ["parallel", "reduction"]}
+      ins(%in, %krn : tensor<9xf32>, tensor<3xf32>) outs(%1 : tensor<4xf32>) {
+  ^bb0(%a: f32, %b: f32, %acc: f32):
+    %3 = arith.mulf %a, %b : f32
+    %4 = arith.addf %3, %acc : f32
+    linalg.yield %4 : f32
+  } -> tensor<4xf32>
+  return %2 : tensor<4xf32>
+}
+
 #map_in = affine_map<(d0, d1) -> (d0, d1)>
 #map_out = affine_map<(d0, d1) -> (d0)>
 
@@ -91,3 +115,8 @@ func.func @test_reduce(%arg0 : tensor<2x3xf32>) -> tensor<2xf32> {
   } -> tensor<2xf32>
   return %2 : tensor<2xf32>
 }
+
+// The strided conv read map is a lambda over %affine ops: `o0 * 2 + o1`.
+// CHECK-DAG: lam affine_map_{{[0-9]+}}
+// CHECK-DAG: %affine.semiop.mul
+// CHECK-DAG: %affine.op.add

@@ -27,6 +27,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 
 #include <mim/lattice.h>
+#include <mim/plug/affine/autogen.h>
 #include <mim/plug/core/core.h>
 #include <mim/plug/math/math.h>
 #include <mim/plug/tensor/autogen.h>
@@ -87,6 +88,104 @@ public:
     pm = world_.app(pm, mim::Defs{world_.lit_nat(numLoops),
                                   world_.lit_nat(subs.size())});
     return world_.app(pm, natTuple(subs));
+  }
+
+  /// Translates an affine expression into a `%affine.index` value over the
+  /// given loop variables (`loopPos` maps MLIR dim positions to loop-vector
+  /// positions). Affine maps in linalg indexing maps have no symbols.
+  FailureOr<const mim::Def *> affineExpr(Operation *op, AffineExpr expr,
+                                         ArrayRef<const mim::Def *> loopVars,
+                                         ArrayRef<int64_t> loopPos) {
+    namespace mimaffine = mim::plug::affine;
+    if (auto dim = dyn_cast<AffineDimExpr>(expr))
+      return loopVars[loopPos[dim.getPosition()]];
+    if (auto cst = dyn_cast<AffineConstantExpr>(expr)) {
+      const auto *c = world_.call<mimaffine::constant>(
+          world_.lit_nat(std::abs(cst.getValue())));
+      if (cst.getValue() < 0)
+        c = world_.call(mimaffine::op::neg, c);
+      return c;
+    }
+    auto bin = dyn_cast<AffineBinaryOpExpr>(expr);
+    if (!bin)
+      return op->emitError("unsupported affine expression");
+
+    if (expr.getKind() == AffineExprKind::Add) {
+      auto lhs = affineExpr(op, bin.getLHS(), loopVars, loopPos);
+      auto rhs = affineExpr(op, bin.getRHS(), loopVars, loopPos);
+      if (failed(lhs) || failed(rhs))
+        return failure();
+      return world_.call(mimaffine::op::add, mim::Defs{*lhs, *rhs});
+    }
+
+    // Mul/Mod/FloorDiv/CeilDiv: affine guarantees a constant right-hand side.
+    auto rhsCst = dyn_cast<AffineConstantExpr>(bin.getRHS());
+    if (!rhsCst)
+      return op->emitError("expected a constant right-hand side");
+    int64_t c = rhsCst.getValue();
+    auto lhs = affineExpr(op, bin.getLHS(), loopVars, loopPos);
+    if (failed(lhs))
+      return failure();
+    auto semiop = [&](mim::plug::affine::semiop id,
+                      int64_t c) -> const mim::Def * {
+      return world_.call(id, mim::Defs{*lhs, world_.lit_nat(c)});
+    };
+    switch (expr.getKind()) {
+    case AffineExprKind::Mul: {
+      const auto *m = semiop(mimaffine::semiop::mul, std::abs(c));
+      if (c < 0)
+        m = world_.call(mimaffine::op::neg, m);
+      return m;
+    }
+    case AffineExprKind::Mod:
+      if (c <= 0)
+        return op->emitError("expected a positive modulus");
+      return semiop(mimaffine::semiop::mod, c);
+    case AffineExprKind::FloorDiv:
+      if (c <= 0)
+        return op->emitError("expected a positive divisor");
+      return semiop(mimaffine::semiop::floordiv, c);
+    case AffineExprKind::CeilDiv:
+      if (c <= 0)
+        return op->emitError("expected a positive divisor");
+      return semiop(mimaffine::semiop::ceildiv, c);
+    default:
+      return op->emitError("unsupported affine expression");
+    }
+  }
+
+  /// Builds a `[«numLoops; %affine.index»] → «r; %affine.index»` read map for
+  /// an arbitrary affine indexing map. Pure dim projections use
+  /// %tensor.proj_map; everything else becomes a lambda over %affine ops.
+  FailureOr<const mim::Def *> affineIndexMap(Operation *op, AffineMap map,
+                                             uint64_t numLoops,
+                                             ArrayRef<int64_t> loopPos) {
+    if (auto dims = projectedDims(map); succeeded(dims)) {
+      SmallVector<int64_t> subs;
+      for (int64_t dim : *dims)
+        subs.push_back(loopPos[dim]);
+      return projMap(numLoops, subs);
+    }
+    if (map.getNumSymbols() != 0)
+      return op->emitError("affine maps with symbols are not supported");
+
+    const auto *indexType = world_.annex<mim::plug::affine::index>();
+    auto *lam = world_.mut_lam(world_.arr(numLoops, indexType),
+                               world_.arr(map.getNumResults(), indexType));
+    lam->set("affine_map");
+    SmallVector<const mim::Def *> loopVars;
+    for (uint64_t i = 0; i < numLoops; ++i)
+      loopVars.push_back(world_.extract(lam->var(), numLoops, i));
+
+    mim::DefVec results;
+    for (AffineExpr expr : map.getResults()) {
+      auto def = affineExpr(op, expr, loopVars, loopPos);
+      if (failed(def))
+        return failure();
+      results.push_back(*def);
+    }
+    lam->set(true, world_.tuple(mim::Defs{results}));
+    return (const mim::Def *)lam;
   }
 
   /// Invokes `%tensor.map_reduce`, passing all implicit arguments explicitly
@@ -368,7 +467,10 @@ public:
     uint64_t outRank = outDims->size();
     uint64_t redRank = iterators.size() - outRank;
 
-    // Loop bounds, ordered by `loopOrder`.
+    // Loop bounds, ordered by `loopOrder`. Requires every loop dimension to
+    // appear as a plain dim result in some indexing map.
+    if (!op.getShapesToLoopsMap())
+      return op.emitError("loop ranges are not computable from the shapes");
     SmallVector<int64_t> ranges = op.getStaticLoopRanges();
     SmallVector<int64_t> loopBounds;
     for (int64_t dim : loopOrder) {
@@ -388,19 +490,16 @@ public:
       const auto *def = moduleTranslation_.lookupValue(value);
       if (!def)
         return op.emitError("failed to lookup input");
-      auto dims = projectedDims(map);
-      if (failed(dims))
-        return op.emitError("expected projected permutation indexing maps");
-      SmallVector<int64_t> subs;
-      for (int64_t dim : *dims)
-        subs.push_back(loopPos[dim]);
+      auto readMap = affineIndexMap(op, map, iterators.size(), loopPos);
+      if (failed(readMap))
+        return failure();
 
       inputs.push_back(def);
       inElemTypes.push_back(
           moduleTranslation_.convertType(inType.getElementType()));
       inShapes.push_back(natTuple(inType.getShape()));
       inRanks.push_back(inType.getRank());
-      maps.push_back(projMap(iterators.size(), subs));
+      maps.push_back(*readMap);
     }
 
     const auto *accType =
