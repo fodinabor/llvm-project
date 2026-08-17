@@ -260,6 +260,75 @@ public:
     return lam;
   }
 
+  /// Builds the fold `f (acc, ys) = ys#0` that ignores its accumulator.
+  const mim::Def *copyFold(const mim::Def *elemType, std::string_view name) {
+    auto *copy =
+        world_.mut_fun(mim::Defs{elemType, world_.arr(1, elemType)}, elemType);
+    copy->set(std::string(name));
+    const auto *ys = world_.extract(copy->var(mim::nat_t(0)), mim::u64(1));
+    copy->app(true, copy->ret_var(), world_.extract(ys, mim::u64(0)));
+    return copy;
+  }
+
+  /// Builds an identity permutation [0, ..., rank-1].
+  SmallVector<int64_t> identityPerm(uint64_t rank) {
+    SmallVector<int64_t> identity(rank);
+    for (uint64_t i = 0; i < rank; ++i)
+      identity[i] = i;
+    return identity;
+  }
+
+  /// Adds two equally shaped tensors elementwise via %tensor.map_reduce.
+  FailureOr<const mim::Def *> elementwiseAdd(Operation *op, Type elemType,
+                                             ArrayRef<int64_t> shape,
+                                             const mim::Def *lhs,
+                                             const mim::Def *rhs) {
+    const auto *type = moduleTranslation_.convertType(elemType);
+    auto *fold =
+        world_.mut_fun(mim::Defs{type, world_.arr(2, type)}, type);
+    fold->set("add_init");
+    const auto *ys = world_.extract(fold->var(mim::nat_t(0)), mim::u64(1));
+    const auto *x = world_.extract(ys, mim::u64(0));
+    const auto *y = world_.extract(ys, mim::u64(1));
+    const mim::Def *sum;
+    if (isa<FloatType>(elemType))
+      sum = world_.call(math::arith::add, world_.lit_nat(0), mim::Defs{x, y});
+    else if (elemType.isSignlessInteger())
+      sum = world_.call(core::wrap::add, world_.lit_nat(0), mim::Defs{x, y});
+    else
+      return op->emitError("unsupported element type for accumulation");
+    fold->app(true, fold->ret_var(), sum);
+
+    uint64_t rank = shape.size();
+    SmallVector<int64_t> identity = identityPerm(rank);
+    const auto *shapeTuple = natTuple(shape);
+    const auto *idMap = projMap(rank, identity);
+    return mapReduce(type, rank, /*redRank=*/0, shape, shape, {type, type},
+                     {int64_t(rank), int64_t(rank)},
+                     {shapeTuple, shapeTuple}, fold, world_.bot(type), idMap,
+                     {idMap, idMap}, {lhs, rhs});
+  }
+
+  /// Accumulating linalg ops add their result onto the `outs` operand: elide
+  /// the addition when the initial value cannot contribute, otherwise add it.
+  FailureOr<const mim::Def *> addInit(Operation *op, Type elemType,
+                                      ArrayRef<int64_t> shape,
+                                      const mim::Def *result,
+                                      const mim::Def *init) {
+    if (isZeroOrUndef(init))
+      return result;
+    return elementwiseAdd(op, elemType, shape, result, init);
+  }
+
+  /// Extracts the splat scalar of a (nested) pack or literal `outs` value.
+  const mim::Def *splatScalar(const mim::Def *def) {
+    while (auto pack = def->isa<mim::Pack>())
+      def = pack->body();
+    if (def->isa<mim::Lit>() || def->isa<mim::Bot>())
+      return def;
+    return nullptr;
+  }
+
   /// Builds a `%tensor.Ring` value `(T, 0, add, mul)` for the given element
   /// type; fails for non-arithmetic element types.
   FailureOr<const mim::Def *> ringFor(Operation *op, Type elemType) {
@@ -280,11 +349,13 @@ public:
 
   /// Converts a linalg body region (block arguments: one per input followed by
   /// one per output/accumulator) into a MimIR fold function
-  /// `Fn [To, «nis; Ti»] → To` for %tensor.map_reduce.
-  FailureOr<const mim::Def *> convertBodyToFold(Block &body,
-                                                const mim::Def *accType,
-                                                ArrayRef<const mim::Def *>
-                                                    inElemTypes) {
+  /// `Fn [To, «nis; Ti»] → To` for %tensor.map_reduce. `indexVals` are the
+  /// results of linalg.index ops in the body; they map to the trailing fold
+  /// inputs (fed by iota tensors).
+  FailureOr<const mim::Def *>
+  convertBodyToFold(Block &body, const mim::Def *accType,
+                    ArrayRef<const mim::Def *> inElemTypes,
+                    ArrayRef<Value> indexVals = {}) {
     auto *fold = world_.mut_fun(
         mim::Defs{accType, world_.sigma(mim::Defs{inElemTypes})}, accType);
     fold->set("linalg_body");
@@ -295,14 +366,18 @@ public:
     const auto *ins = world_.extract(accAndIns, mim::u64(1));
 
     size_t numIns = inElemTypes.size();
-    if (body.getNumArguments() != numIns + 1)
+    size_t numBodyIns = numIns - indexVals.size();
+    if (body.getNumArguments() != numBodyIns + 1)
       return failure();
     for (auto [index, arg] : llvm::enumerate(body.getArguments())) {
-      if (index < numIns)
+      if (index < numBodyIns)
         moduleTranslation_.mapValue(arg, world_.extract(ins, numIns, index));
       else
         moduleTranslation_.mapValue(arg, acc);
     }
+    for (auto [index, value] : llvm::enumerate(indexVals))
+      moduleTranslation_.mapValue(
+          value, world_.extract(ins, numIns, numBodyIns + index));
 
     // Convert the body ops into the fold lambda; linalg.yield applies the
     // return continuation. Save and restore the CPS insertion state of the
@@ -368,27 +443,143 @@ public:
     for (auto [i, p] : llvm::enumerate(perm))
       invPerm[p] = i;
 
-    const auto *elemType = moduleTranslation_.convertType(inType.getElementType());
-
-    // The copy fold ignores the accumulator: `f (acc, ys) = ys#0`.
-    auto *copy = world_.mut_fun(
-        mim::Defs{elemType, world_.arr(1, elemType)}, elemType);
-    copy->set("transpose_copy");
-    const auto *ys =
-        world_.extract(copy->var(mim::nat_t(0)), mim::u64(1));
-    copy->app(true, copy->ret_var(), world_.extract(ys, mim::u64(0)));
-
-    SmallVector<int64_t> identity(rank);
-    for (uint64_t i = 0; i < rank; ++i)
-      identity[i] = i;
-
+    const auto *elemType =
+        moduleTranslation_.convertType(inType.getElementType());
+    const auto *copy = copyFold(elemType, "transpose_copy");
     const auto *result = mapReduce(
         elemType, rank, /*redRank=*/0, outType.getShape(), outType.getShape(),
         {elemType}, {int64_t(rank)}, {natTuple(inType.getShape())}, copy,
-        world_.bot(elemType), projMap(rank, identity),
+        world_.bot(elemType), projMap(rank, identityPerm(rank)),
         {projMap(rank, invPerm)}, {input});
     moduleTranslation_.mapValue(op.getResult().front(), result);
     return success();
+  }
+
+  // linalg.broadcast: a map_reduce copy whose read map projects the preserved
+  // dimensions (`dimensions` lists the added output dims).
+  LogicalResult operator()(linalg::BroadcastOp op) {
+    auto inType = dyn_cast<RankedTensorType>(op.getInput().getType());
+    auto outType = dyn_cast<RankedTensorType>(op.getInit().getType());
+    if (!inType || !outType || !inType.hasStaticShape() ||
+        !outType.hasStaticShape())
+      return op.emitError("expected statically shaped tensors");
+    const auto *input = moduleTranslation_.lookupValue(op.getInput());
+    if (!input)
+      return op.emitError("failed to lookup broadcast input");
+
+    llvm::SmallDenseSet<int64_t> added(op.getDimensions().begin(),
+                                       op.getDimensions().end());
+    SmallVector<int64_t> subs;
+    for (int64_t dim = 0; dim < outType.getRank(); ++dim)
+      if (!added.contains(dim))
+        subs.push_back(dim);
+    if (int64_t(subs.size()) != inType.getRank())
+      return op.emitError("unexpected broadcast dimensions");
+
+    uint64_t rank = outType.getRank();
+    const auto *elemType =
+        moduleTranslation_.convertType(inType.getElementType());
+    const auto *copy = copyFold(elemType, "broadcast_copy");
+    const auto *result = mapReduce(
+        elemType, rank, /*redRank=*/0, outType.getShape(), outType.getShape(),
+        {elemType}, {inType.getRank()}, {natTuple(inType.getShape())}, copy,
+        world_.bot(elemType), projMap(rank, identityPerm(rank)),
+        {projMap(rank, subs)}, {input});
+    moduleTranslation_.mapValue(op->getResult(0), result);
+    return success();
+  }
+
+  // linalg.conv_2d_nchw_fchw: %tensor.conv over a ring, plus an elementwise
+  // addition of the `outs` operand (the bias) when it contributes.
+  LogicalResult operator()(linalg::Conv2DNchwFchwOp op) {
+    auto inType = dyn_cast<RankedTensorType>(op.getInputs()[0].getType());
+    auto wType = dyn_cast<RankedTensorType>(op.getInputs()[1].getType());
+    auto outType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (!inType || !wType || !inType.hasStaticShape() ||
+        !wType.hasStaticShape() || !outType.hasStaticShape())
+      return op.emitError("expected statically shaped tensors");
+    const auto *input = moduleTranslation_.lookupValue(op.getInputs()[0]);
+    const auto *weight = moduleTranslation_.lookupValue(op.getInputs()[1]);
+    const auto *init = moduleTranslation_.lookupValue(op.getOutputs()[0]);
+    if (!input || !weight || !init)
+      return op.emitError("failed to lookup convolution operands");
+
+    auto ring = ringFor(op, inType.getElementType());
+    if (failed(ring))
+      return failure();
+
+    SmallVector<int64_t> strides(op.getStrides().getValues<int64_t>());
+    SmallVector<int64_t> dilations(op.getDilations().getValues<int64_t>());
+    ArrayRef<int64_t> in = inType.getShape(), w = wType.getShape();
+
+    const auto *conv = world_.annex<mim::plug::tensor::conv>();
+    conv = world_.app(conv, *ring);
+    conv = world_.app(conv, natTuple({in[0], in[1], w[0], in[2], in[3],
+                                      w[2], w[3]})); // {n cin cout h w kh kw}
+    conv = world_.app(conv, mim::Defs{natTuple(strides), natTuple(dilations),
+                                      natTuple({0, 0})});
+    const auto *result = world_.app(conv, mim::Defs{input, weight});
+
+    auto sum = addInit(op, inType.getElementType(), outType.getShape(),
+                       result, init);
+    if (failed(sum))
+      return failure();
+    moduleTranslation_.mapValue(op->getResult(0), *sum);
+    return success();
+  }
+
+  // linalg.pooling_nchw_{max,sum}: %tensor.pool. The second input only
+  // carries the window shape; the fold is seeded from the splat `outs` value.
+  template <class PoolOp, class Id>
+  LogicalResult convertPooling(PoolOp op, Id mimId, std::string_view name) {
+    auto inType = dyn_cast<RankedTensorType>(op.getInputs()[0].getType());
+    auto windowType = dyn_cast<RankedTensorType>(op.getInputs()[1].getType());
+    auto outType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (!inType || !windowType || !outType || !inType.hasStaticShape() ||
+        !windowType.hasStaticShape() || !outType.hasStaticShape())
+      return op.emitError("expected statically shaped tensors");
+    const auto *input = moduleTranslation_.lookupValue(op.getInputs()[0]);
+    const auto *outs = moduleTranslation_.lookupValue(op.getOutputs()[0]);
+    if (!input || !outs)
+      return op.emitError("failed to lookup pooling operands");
+    const auto *init = splatScalar(outs);
+    if (!init)
+      return op.emitError("pooling requires a splat `outs` initial value");
+
+    const auto *elemType =
+        moduleTranslation_.convertType(inType.getElementType());
+    const auto *fold = binaryRingOp(elemType, mimId, name);
+    SmallVector<int64_t> strides(
+        op.getStrides().template getValues<int64_t>());
+    SmallVector<int64_t> dilations(
+        op.getDilations().template getValues<int64_t>());
+    ArrayRef<int64_t> in = inType.getShape(), out = outType.getShape();
+
+    const auto *pool = world_.annex<mim::plug::tensor::pool>();
+    pool = world_.app(pool, elemType);
+    pool = world_.app(pool, mim::Defs{fold, init});
+    pool = world_.app(pool, natTuple({in[0], in[1], in[2], in[3]}));
+    pool = world_.app(pool, mim::Defs{natTuple(windowType.getShape()),
+                                      natTuple(strides), natTuple(dilations),
+                                      natTuple({0, 0}),
+                                      natTuple({out[2], out[3]})});
+    moduleTranslation_.mapValue(op->getResult(0), world_.app(pool, input));
+    return success();
+  }
+
+  LogicalResult operator()(linalg::PoolingNchwMaxOp op) {
+    return convertPooling(op, math::extrema::fmax, "pool_max");
+  }
+  LogicalResult operator()(linalg::PoolingNchwSumOp op) {
+    return convertPooling(op, math::arith::add, "pool_sum");
+  }
+
+  // linalg.index: handled by the enclosing linalg.generic conversion, which
+  // maps its result to an extra iota input of the fold.
+  LogicalResult operator()(linalg::IndexOp op) {
+    if (moduleTranslation_.lookupValue(op.getResult()))
+      return success();
+    return op.emitError("linalg.index outside a supported linalg.generic");
   }
 
   /// Builds a `«n; Idx rank»` tuple of index literals.
@@ -417,12 +608,6 @@ public:
     if (!lhs || !rhs || !init)
       return op.emitError("failed to lookup contraction operands");
 
-    // The contraction accumulates onto its `outs` operand; elide the addition
-    // when the initial value cannot contribute.
-    if (!isZeroOrUndef(init))
-      return op.emitError(
-          "only zero-initialized `outs` operands are supported");
-
     auto ring = ringFor(op, lhsType.getElementType());
     if (failed(ring))
       return failure();
@@ -439,7 +624,13 @@ public:
                                   natTuple(rhsType.getShape())});
     const auto *product = world_.app(dp, mim::Defs{lhs, rhs});
 
-    moduleTranslation_.mapValue(op.getResult(0), product);
+    // The contraction accumulates onto its `outs` operand.
+    auto outType = cast<RankedTensorType>(op->getResult(0).getType());
+    auto sum = addInit(op, outType.getElementType(), outType.getShape(),
+                       product, init);
+    if (failed(sum))
+      return failure();
+    moduleTranslation_.mapValue(op.getResult(0), *sum);
     return success();
   }
 
@@ -548,6 +739,25 @@ public:
       maps.push_back(*readMap);
     }
 
+    // linalg.index ops become extra iota inputs, read along their dimension:
+    // the fold receives the current index as an ordinary input element.
+    SmallVector<Value> indexVals;
+    for (linalg::IndexOp indexOp : op.getBody()->getOps<linalg::IndexOp>()) {
+      int64_t dim = indexOp.getDim();
+      if (ShapedType::isDynamic(ranges[dim]))
+        return op.emitError("failed to derive a bound for linalg.index");
+      const auto *idxType = world_.type_int(64);
+      mim::DefVec iota;
+      for (int64_t i = 0; i < ranges[dim]; ++i)
+        iota.push_back(world_.lit(idxType, i));
+      inputs.push_back(world_.tuple(mim::Defs{iota}));
+      inElemTypes.push_back(idxType);
+      inShapes.push_back(natTuple(ranges[dim]));
+      inRanks.push_back(1);
+      maps.push_back(projMap(iterators.size(), loopPos[dim]));
+      indexVals.push_back(indexOp.getResult());
+    }
+
     const auto *accType =
         moduleTranslation_.convertType(outType.getElementType());
 
@@ -559,33 +769,21 @@ public:
     } else {
       const auto *outsDef =
           moduleTranslation_.lookupValue(op.getOutputs().front());
-      const mim::Def *scalar = outsDef;
-      while (scalar) {
-        if (auto pack = scalar->isa<mim::Pack>()) {
-          scalar = pack->body();
-          continue;
-        }
-        break;
-      }
-      if (!scalar || (!scalar->isa<mim::Lit>() && !scalar->isa<mim::Bot>()))
+      init = outsDef ? splatScalar(outsDef) : nullptr;
+      if (!init)
         return op.emitError(
             "reductions require a splat `outs` initial value");
-      init = scalar;
     }
 
     auto fold =
-        convertBodyToFold(*op.getBody(), accType, inElemTypes);
+        convertBodyToFold(*op.getBody(), accType, inElemTypes, indexVals);
     if (failed(fold))
       return op.emitError("failed to convert the body region");
 
-    SmallVector<int64_t> identity(outRank);
-    for (uint64_t i = 0; i < outRank; ++i)
-      identity[i] = i;
-
     const auto *result = mapReduce(
         accType, outRank, redRank, outType.getShape(), loopBounds, inElemTypes,
-        inRanks, inShapes, *fold, init, projMap(iterators.size(), identity),
-        maps, inputs);
+        inRanks, inShapes, *fold, init,
+        projMap(iterators.size(), identityPerm(outRank)), maps, inputs);
     moduleTranslation_.mapValue(op.getResult(0), result);
     return success();
   }
@@ -611,7 +809,9 @@ public:
     return llvm::TypeSwitch<Operation *, LogicalResult>(op)
         .Case<linalg::YieldOp, linalg::FillOp, linalg::TransposeOp,
               linalg::MatmulOp, linalg::BatchMatmulOp, linalg::MatvecOp,
-              linalg::DotOp, linalg::GenericOp>(
+              linalg::DotOp, linalg::GenericOp, linalg::BroadcastOp,
+              linalg::Conv2DNchwFchwOp, linalg::PoolingNchwMaxOp,
+              linalg::PoolingNchwSumOp, linalg::IndexOp>(
             [&](auto typedOp) { return visitor(typedOp); })
         .Default([&](Operation *) { return visitor(op); });
   }

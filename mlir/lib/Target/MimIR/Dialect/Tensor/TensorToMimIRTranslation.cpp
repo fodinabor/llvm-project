@@ -22,6 +22,38 @@ using namespace mlir;
 
 namespace {
 
+/// Builds a `«r; Nat»` tuple of literals.
+static const mim::Def *natTuple(mim::World &world, ArrayRef<int64_t> values) {
+  mim::DefVec nats;
+  for (int64_t v : values)
+    nats.push_back(world.lit_nat(v));
+  return world.tuple(mim::Defs{nats});
+}
+
+/// Translates a row-major reshape (tensor.collapse_shape/expand_shape) to
+/// %tensor.reshape.
+static LogicalResult
+convertReshape(Operation *op, Value src, RankedTensorType srcType,
+               RankedTensorType resultType, mim::World &world,
+               MimIR::ModuleTranslation &moduleTranslation) {
+  if (!srcType.hasStaticShape() || !resultType.hasStaticShape())
+    return op->emitError("dynamic tensor shapes are not supported");
+  const auto *input = moduleTranslation.lookupValue(src);
+  if (!input)
+    return op->emitError("failed to lookup reshape source");
+  const auto *elemType =
+      moduleTranslation.convertType(srcType.getElementType());
+
+  const auto *reshape = world.annex<mim::plug::tensor::reshape>();
+  reshape = world.app(reshape,
+                      mim::Defs{elemType, world.lit_nat(srcType.getRank()),
+                                world.lit_nat(resultType.getRank())});
+  reshape = world.app(reshape, natTuple(world, srcType.getShape()));
+  reshape = world.app(reshape, natTuple(world, resultType.getShape()));
+  moduleTranslation.mapValue(op->getResult(0), world.app(reshape, input));
+  return success();
+}
+
 /// Builds the implicit arguments {T, r, s} of %tensor.get / %tensor.set and
 /// the `«i: r; Idx (s#i)»` index tuple for the given tensor access. Indices
 /// are `index`-typed (Idx 2^64) and are narrowed to `Idx (s#i)`.
@@ -103,6 +135,47 @@ public:
           world.app(set, mim::Defs{destDef, indexTuple, scalarDef}));
       return success();
     }
+
+    // tensor.pad with a constant padding value -> %tensor.pad (mode 0).
+    if (auto padOp = dyn_cast<tensor::PadOp>(op)) {
+      auto srcType = padOp.getSourceType();
+      if (!srcType.hasStaticShape() ||
+          !padOp.getResultType().hasStaticShape())
+        return op->emitError("dynamic tensor shapes are not supported");
+      if (llvm::any_of(padOp.getStaticLow(), ShapedType::isDynamic) ||
+          llvm::any_of(padOp.getStaticHigh(), ShapedType::isDynamic))
+        return op->emitError("dynamic padding amounts are not supported");
+      Value padValue = padOp.getConstantPaddingValue();
+      if (!padValue)
+        return op->emitError("only constant padding values are supported");
+      const auto *source = moduleTranslation.lookupValue(padOp.getSource());
+      const auto *value = moduleTranslation.lookupValue(padValue);
+      if (!source || !value)
+        return op->emitError("failed to lookup pad operands");
+      const auto *elemType =
+          moduleTranslation.convertType(srcType.getElementType());
+
+      const auto *pad = world.annex<mim::plug::tensor::pad>();
+      pad = world.app(pad,
+                      mim::Defs{elemType, world.lit_nat(srcType.getRank())});
+      pad = world.app(pad, natTuple(world, srcType.getShape()));
+      pad = world.app(pad, mim::Defs{world.lit_nat(0),
+                                     natTuple(world, padOp.getStaticLow()),
+                                     natTuple(world, padOp.getStaticHigh())});
+      moduleTranslation.mapValue(padOp.getResult(),
+                                 world.app(pad, mim::Defs{source, value}));
+      return success();
+    }
+
+    // Reassociating reshapes are row-major reshapes.
+    if (auto collapseOp = dyn_cast<tensor::CollapseShapeOp>(op))
+      return convertReshape(op, collapseOp.getSrc(), collapseOp.getSrcType(),
+                            collapseOp.getResultType(), world,
+                            moduleTranslation);
+    if (auto expandOp = dyn_cast<tensor::ExpandShapeOp>(op))
+      return convertReshape(op, expandOp.getSrc(), expandOp.getSrcType(),
+                            expandOp.getResultType(), world,
+                            moduleTranslation);
 
     return op->emitError("unsupported tensor operation in MimIR translation");
   }
