@@ -90,15 +90,39 @@ public:
     return world_.app(pm, natTuple(subs));
   }
 
+  /// Interprets a value as the loop-invariant scalar of a semi-affine
+  /// operation: a non-negative constant becomes a Nat literal, a bound symbol
+  /// value is bitcast to Nat. Returns nullptr otherwise.
+  const mim::Def *semiAffineNat(AffineExpr expr,
+                                ArrayRef<const mim::Def *> symbols) {
+    if (auto cst = dyn_cast<AffineConstantExpr>(expr))
+      return cst.getValue() >= 0 ? world_.lit_nat(cst.getValue()) : nullptr;
+    if (auto sym = dyn_cast<AffineSymbolExpr>(expr))
+      if (sym.getPosition() < symbols.size())
+        return world_.call<core::bitcast>(world_.type_nat(),
+                                          symbols[sym.getPosition()]);
+    return nullptr;
+  }
+
   /// Translates an affine expression into a `%affine.index` value over the
   /// given loop variables (`loopPos` maps MLIR dim positions to loop-vector
-  /// positions). Affine maps in linalg indexing maps have no symbols.
+  /// positions). Symbols are the "curried" arguments of an affine map: they
+  /// are bound to the loop-invariant `symbols` values, which the resulting
+  /// map lambda simply closes over.
   FailureOr<const mim::Def *> affineExpr(Operation *op, AffineExpr expr,
                                          ArrayRef<const mim::Def *> loopVars,
-                                         ArrayRef<int64_t> loopPos) {
+                                         ArrayRef<int64_t> loopPos,
+                                         ArrayRef<const mim::Def *> symbols) {
     namespace mimaffine = mim::plug::affine;
     if (auto dim = dyn_cast<AffineDimExpr>(expr))
       return loopVars[loopPos[dim.getPosition()]];
+    if (auto sym = dyn_cast<AffineSymbolExpr>(expr)) {
+      if (sym.getPosition() >= symbols.size())
+        return op->emitError("no value bound for affine symbol");
+      // A loop-invariant "constant" index from the symbol's runtime value.
+      return world_.call<mimaffine::constant>(world_.call<core::bitcast>(
+          world_.type_nat(), symbols[sym.getPosition()]));
+    }
     if (auto cst = dyn_cast<AffineConstantExpr>(expr)) {
       const auto *c = world_.call<mimaffine::constant>(
           world_.lit_nat(std::abs(cst.getValue())));
@@ -111,44 +135,51 @@ public:
       return op->emitError("unsupported affine expression");
 
     if (expr.getKind() == AffineExprKind::Add) {
-      auto lhs = affineExpr(op, bin.getLHS(), loopVars, loopPos);
-      auto rhs = affineExpr(op, bin.getRHS(), loopVars, loopPos);
+      auto lhs = affineExpr(op, bin.getLHS(), loopVars, loopPos, symbols);
+      auto rhs = affineExpr(op, bin.getRHS(), loopVars, loopPos, symbols);
       if (failed(lhs) || failed(rhs))
         return failure();
       return world_.call(mimaffine::op::add, mim::Defs{*lhs, *rhs});
     }
 
-    // Mul/Mod/FloorDiv/CeilDiv: affine guarantees a constant right-hand side.
-    auto rhsCst = dyn_cast<AffineConstantExpr>(bin.getRHS());
-    if (!rhsCst)
-      return op->emitError("expected a constant right-hand side");
-    int64_t c = rhsCst.getValue();
-    auto lhs = affineExpr(op, bin.getLHS(), loopVars, loopPos);
-    if (failed(lhs))
-      return failure();
-    auto semiop = [&](mim::plug::affine::semiop id,
-                      int64_t c) -> const mim::Def * {
-      return world_.call(id, mim::Defs{*lhs, world_.lit_nat(c)});
-    };
-    switch (expr.getKind()) {
-    case AffineExprKind::Mul: {
-      const auto *m = semiop(mimaffine::semiop::mul, std::abs(c));
-      if (c < 0)
-        m = world_.call(mimaffine::op::neg, m);
-      return m;
+    // Mul/Mod/FloorDiv/CeilDiv: the scalar side must be constant with regard
+    // to the loop indices — a constant or a bound symbol. Affine canonical
+    // form keeps it on the right (for Mul, allow either side).
+    const mim::Def *scalar = semiAffineNat(bin.getRHS(), symbols);
+    AffineExpr indexSide = bin.getLHS();
+    if (!scalar && expr.getKind() == AffineExprKind::Mul) {
+      scalar = semiAffineNat(bin.getLHS(), symbols);
+      indexSide = bin.getRHS();
     }
+    if (!scalar) {
+      // A negative constant multiplier is expressible via negation.
+      if (auto rhsCst = dyn_cast<AffineConstantExpr>(bin.getRHS());
+          rhsCst && expr.getKind() == AffineExprKind::Mul) {
+        auto lhs = affineExpr(op, bin.getLHS(), loopVars, loopPos, symbols);
+        if (failed(lhs))
+          return failure();
+        const auto *m = world_.call(
+            mimaffine::semiop::mul,
+            mim::Defs{*lhs, world_.lit_nat(std::abs(rhsCst.getValue()))});
+        return world_.call(mimaffine::op::neg, m);
+      }
+      return op->emitError(
+          "expected a constant or symbol scalar in a semi-affine expression");
+    }
+    auto index = affineExpr(op, indexSide, loopVars, loopPos, symbols);
+    if (failed(index))
+      return failure();
+    switch (expr.getKind()) {
+    case AffineExprKind::Mul:
+      return world_.call(mimaffine::semiop::mul, mim::Defs{*index, scalar});
     case AffineExprKind::Mod:
-      if (c <= 0)
-        return op->emitError("expected a positive modulus");
-      return semiop(mimaffine::semiop::mod, c);
+      return world_.call(mimaffine::semiop::mod, mim::Defs{*index, scalar});
     case AffineExprKind::FloorDiv:
-      if (c <= 0)
-        return op->emitError("expected a positive divisor");
-      return semiop(mimaffine::semiop::floordiv, c);
+      return world_.call(mimaffine::semiop::floordiv,
+                         mim::Defs{*index, scalar});
     case AffineExprKind::CeilDiv:
-      if (c <= 0)
-        return op->emitError("expected a positive divisor");
-      return semiop(mimaffine::semiop::ceildiv, c);
+      return world_.call(mimaffine::semiop::ceildiv,
+                         mim::Defs{*index, scalar});
     default:
       return op->emitError("unsupported affine expression");
     }
@@ -157,17 +188,19 @@ public:
   /// Builds a `[«numLoops; %affine.index»] → «r; %affine.index»` read map for
   /// an arbitrary affine indexing map. Pure dim projections use
   /// %tensor.proj_map; everything else becomes a lambda over %affine ops.
-  FailureOr<const mim::Def *> affineIndexMap(Operation *op, AffineMap map,
-                                             uint64_t numLoops,
-                                             ArrayRef<int64_t> loopPos) {
+  /// `symbols` supplies the values the map's symbols are bound to (linalg
+  /// indexing maps carry none by construction, but e.g. affine.apply-style
+  /// clients have operands for them).
+  FailureOr<const mim::Def *>
+  affineIndexMap(Operation *op, AffineMap map, uint64_t numLoops,
+                 ArrayRef<int64_t> loopPos,
+                 ArrayRef<const mim::Def *> symbols = {}) {
     if (auto dims = projectedDims(map); succeeded(dims)) {
       SmallVector<int64_t> subs;
       for (int64_t dim : *dims)
         subs.push_back(loopPos[dim]);
       return projMap(numLoops, subs);
     }
-    if (map.getNumSymbols() != 0)
-      return op->emitError("affine maps with symbols are not supported");
 
     const auto *indexType = world_.annex<mim::plug::affine::index>();
     auto *lam = world_.mut_lam(world_.arr(numLoops, indexType),
@@ -179,7 +212,7 @@ public:
 
     mim::DefVec results;
     for (AffineExpr expr : map.getResults()) {
-      auto def = affineExpr(op, expr, loopVars, loopPos);
+      auto def = affineExpr(op, expr, loopVars, loopPos, symbols);
       if (failed(def))
         return failure();
       results.push_back(*def);
@@ -467,15 +500,28 @@ public:
     uint64_t outRank = outDims->size();
     uint64_t redRank = iterators.size() - outRank;
 
-    // Loop bounds, ordered by `loopOrder`. Requires every loop dimension to
-    // appear as a plain dim result in some indexing map.
-    if (!op.getShapesToLoopsMap())
-      return op.emitError("loop ranges are not computable from the shapes");
-    SmallVector<int64_t> ranges = op.getStaticLoopRanges();
+    // Loop bounds: a loop dimension is bounded by the static extent of any
+    // operand axis that reads it as a plain dim. (Not getStaticLoopRanges():
+    // that asserts on indexing maps with symbols instead of diagnosing.)
+    SmallVector<int64_t> ranges(iterators.size(), ShapedType::kDynamic);
+    for (auto [operand, map] :
+         llvm::zip(op->getOperands(), indexingMaps)) {
+      auto shapedType = dyn_cast<RankedTensorType>(operand.getType());
+      if (!shapedType)
+        continue;
+      for (auto [pos, expr] : llvm::enumerate(map.getResults())) {
+        auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+        if (!dimExpr || shapedType.isDynamicDim(pos))
+          continue;
+        if (ShapedType::isDynamic(ranges[dimExpr.getPosition()]))
+          ranges[dimExpr.getPosition()] = shapedType.getDimSize(pos);
+      }
+    }
     SmallVector<int64_t> loopBounds;
     for (int64_t dim : loopOrder) {
       if (ShapedType::isDynamic(ranges[dim]))
-        return op.emitError("dynamic loop ranges are not supported");
+        return op.emitError("failed to derive a static bound for loop dim ")
+               << dim;
       loopBounds.push_back(ranges[dim]);
     }
 
